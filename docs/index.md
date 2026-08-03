@@ -1,12 +1,11 @@
 # AI Sessions on RCC
 
 ai-session is a local large-language-model service on the University of Chicago Research
-Computing Cluster (RCC). Instead of sending data to a commercial provider,
-faculty and students run open LLM models on the GPUs the university already has.
+Computing Cluster (RCC). Instead of sending data to a commercial provider faculty and students run open LLM models on the GPUs the university already has.
 Compared with a cloud AI service: your prompts, code, and data never leave the
-university's systems, which matters for unpublished results; usage is accounted
+university's systems; usage is accounted
 internally in Service Units (SU); and the served models are open-weights
-checkpoints, so the exact model behind a result can be named and served again. 
+checkpoints, so the exact model behind a result can be named and served again (for provenance and publishing your research online). 
 You start a session, which serves a model on cluster GPUs, which is reached via ssh-tunnel. For chatting with the LLM you have two ways:
 browser chat with Open WebUI ([Getting Started](getting-started.md)) or command-line/in-editor coding tools ([Coding Sessions](coding/overview.md)).
 
@@ -102,7 +101,7 @@ License plus an Acceptable Use Policy) is also available to any user with
 `--model llama3.1_70B`, once you record a one-time license acknowledgment (the
 Llama 3.1 Community License permits this use, with conditions; see
 [Model licenses](licenses.md)). A Qwen2.5-0.5B-Instruct
-checkpoint (Apache-2.0) is staged for smoke tests only and is not offered for user
+checkpoint (Apache-2.0) is staged for tests only and is not offered for user
 sessions.
 
 Larger models are staged but not yet servable. Qwen3.5-122B-A10B (FP8) is
@@ -110,8 +109,7 @@ registered and its weights are on disk; it becomes available once it passes
 validation on the cluster's H200 nodes. It is a vision-language model, so it
 will be the first served model to accept images alongside text. GLM-5.2 (FP8),
 a text-only model, is likewise registered with its weights on disk, but it
-needs multi-node H200 serving that is not yet built; GLM-5.1 comes later. The H200 hardware itself is already on the cluster;
-what is pending is the serving work, not the machines.
+needs multi-node H200 serving that is not yet built.
 
 Guidance on choosing between the served models is on the
 [coding overview](coding/overview.md) page, and a rough capability frame of
