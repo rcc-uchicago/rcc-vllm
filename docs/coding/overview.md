@@ -1,7 +1,7 @@
 # Coding Sessions
 
 A coding session serves a code-specialized language model on an RCC GPU node and
-connects it to a coding tool that reads and edits source code in your git
+connects it to a coding tool that reads and edits source code in your project folder or git
 repository. No prompt, file content, or completion leaves the cluster. The
 command-line tools (aider, opencode) run in the terminal where your code already
 lives, over SSH, with no graphical display needed and no copy of the repository
@@ -15,8 +15,8 @@ shape: a coding tool is an interactive program you drive by hand, not a backgrou
 server, so `ai-session code` starts the session and the gateway — the small
 always-on connection point the service runs on the login node — and then prints
 the ready-to-run client command, which you run yourself in the repository you want
-to edit. The default client is aider; [Continue](continue.md) and
-[opencode and Cline](opencode.md) connect to the same endpoint. The stack is the
+to edit. The default client is aider (which requires your project folder to have a git project); [Continue](continue.md) and
+[opencode and Cline](opencode.md) connect to the same endpoint. The pipeline is the
 same three pieces described on [AI Sessions on RCC](../index.md): a model server
 on a GPU node, the gateway (which gives every session one stable web address in
 the standard OpenAI API format that most AI tools can talk to, and records token
@@ -230,7 +230,7 @@ RCC staff; ask them, or see the staff guide in the repository.
 ## Context window and prompt sizing
 
 Coding sessions serve a 32768-token context. This is the native context length of
-the Qwen2.5 models; no rope/YaRN scaling is applied. Chat sessions default
+the Qwen2.5 models. Chat sessions default
 to 8192.
 
 The aider metadata file declares the split as 28000 input tokens and 4096 output
