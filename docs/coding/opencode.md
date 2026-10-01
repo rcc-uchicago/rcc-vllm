@@ -4,12 +4,11 @@ opencode and Cline are autonomous coding agents. They differ from [aider](aider.
 in how they drive the model: instead of asking for edits as plain text, they use
 native function calling (tool calling), where the model returns a
 structured call — a function name plus JSON arguments — that the agent then executes
-(read a file, apply an edit, run a command (grep), run a tool (squeue)). opencode is a supported client;
-it needs the two files described in Step 2 — a provider configuration
-(`opencode.json`) and a workaround rules file (`AGENTS.md`) — and occasional
-retries even with them. aider remains
-the default and recommended client: it performs the same edits through the
-chat-completions API without function calling and needs no workaround.
+(read a file, apply an edit, run a command (grep), run a tool (squeue)). opencode is a
+supported client; it needs the provider configuration (`opencode.json`) described in Step 2,
+and occasionally a retry. aider remains the default and recommended client: it performs the
+same edits through the chat-completions API without function calling and needs no
+per-repository configuration at all.
 
 Because these agents need function calling, the session must be started with tool
 calling enabled (`ai-session code --agent`); a session started for aider or
@@ -22,7 +21,7 @@ calling enabled (`ai-session code --agent`); a session started for aider or
 | Step | Description | Command | Run on |
 |---|---|---|---|
 | 1 | Start a session with tool calling enabled | `ai-session code --agent` | Login node |
-| 2 | Get opencode, then create `opencode.json` and `AGENTS.md` in your repository (Step 2 below) | `module load opencode` (login node) or `curl -fsSL https://opencode.ai/install \| bash` (laptop) | Wherever opencode runs |
+| 2 | Get opencode, then create `opencode.json` in your repository (Step 2 below) | `module load opencode` (login node) or `curl -fsSL https://opencode.ai/install \| bash` (laptop) | Wherever opencode runs |
 | 3 | Run opencode inside your git repository | `opencode` | Laptop or login node |
 | 4 | Stop the session when finished | `ai-session stop` | Login node |
 
@@ -36,17 +35,16 @@ ai-session code --agent
 ```
 
 !!! warning "A running session consumes SU whether or not you send requests"
-    The reservation floor for the default configuration (Qwen2.5-Coder-32B, 2 A100
+    The reservation floor for the default configuration (Qwen3.8-27B, 2 A100
     GPUs) is 2.0 SU per hour; see [Billing](../billing.md). Stop with
     `ai-session stop` as soon as you finish.
 
-`--agent` starts the model server with tool calling enabled (the `hermes` parser,
-which extracts tool calls from Qwen-model output). This switch controls only tool
-calling; the served context length is independent of it and stays at the coding
-default of 32768 tokens.
+`--agent` starts the model server with tool calling enabled, selecting the tool-call
+parser that matches the model you are serving. This switch controls only tool calling; the
+served context length is independent of it and stays at the coding default of 32768 tokens.
 
 The command blocks until the model is loaded (typically several minutes for the
-32B model) and then prints a block containing the session's port (`GW_PORT`), the
+27B model) and then prints a block containing the session's port (`GW_PORT`), the
 connection parameters, and the SSH tunnel command. Note the port; you need it in
 Step 2. Verify at any time (no cost):
 
@@ -71,11 +69,9 @@ script, `curl -fsSL https://opencode.ai/install | bash` (or
 `localhost:<GW_PORT>` reaches the session (see
 [Coding Sessions](overview.md)); on a login node no tunnel is needed.
 
-Two files must be placed in the repository you are editing: `opencode.json` (the
-provider configuration) and `AGENTS.md` (a rules file without which the model does
-not emit parseable tool calls — 0 of 10 task runs passed without it in the
-2026-07-03 verification). A project-local `opencode.json` is merged over your
-personal `~/.config/opencode/opencode.json`, so nothing personal is modified.
+One file must be placed in the repository you are editing: `opencode.json` (the
+provider configuration). A project-local `opencode.json` is merged over your personal
+`~/.config/opencode/opencode.json`, so nothing personal is modified.
 
 ### opencode.json
 
@@ -96,8 +92,8 @@ root with exactly the following content, which reproduces the example file:
 ```json title="opencode.json"
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "rcc/qwen2.5_coder_32B",
-  "small_model": "rcc/qwen2.5_coder_32B",
+  "model": "rcc/qwen3.8_27B",
+  "small_model": "rcc/qwen3.8_27B",
   "share": "disabled",
   "autoupdate": false,
   "enabled_providers": ["rcc"],
@@ -117,8 +113,8 @@ root with exactly the following content, which reproduces the example file:
         "apiKey": "{env:AISESSION_API_KEY}"
       },
       "models": {
-        "qwen2.5_coder_32B": {
-          "name": "Qwen2.5 Coder 32B (local)",
+        "qwen3.8_27B": {
+          "name": "Qwen3.8-27B (local)",
           "limit": {
             "context": 32768,
             "output": 8192
@@ -157,56 +153,27 @@ sizes its prompts correctly.
 The `mcp` block matters more than it looks: MCP servers from your personal
 configuration are advertised to the model as extra tools and inflate every prompt.
 
-### AGENTS.md 
+### If you have an `AGENTS.md` workaround file, delete it
 
-This is mainly needed for **opencode** .
+Earlier versions of these instructions required an `AGENTS.md` rules file in your repository
+root that told the model to spell out `<tool_call>` tags character by character. **That file
+is now counterproductive: delete it.** Every served model emits tool calls natively, and the
+launcher selects the parser that matches the model — `qwen3_coder` for `qwen3.8_27B`, whose
+calls come back in an XML form:
 
-Create `AGENTS.md` in the repository root with exactly the following content.
-Reason: the served Qwen2.5-Coder-32B-Instruct checkpoint does not generate the
-`<tool_call>` / `</tool_call>` marker tokens (vocabulary ids 151657 and 151658)
-that the model server's `hermes` parser matches — at temperature 0 the tags are simply
-omitted — so without this file the tool JSON streams back as plain text that
-opencode ignores. The rules file instructs the model to write the tags as ordinary
-characters, spelled out piece by piece; written that way, the tags survive
-generation and the parser matches them after decoding. The file deliberately never
-contains the literal tag string, which would tokenize to the very marker token the
-model cannot reproduce.
-
-```markdown title="AGENTS.md"
-# Rules
-
-CRITICAL tool-call format rule. When you invoke a tool, output the tool-call JSON
-wrapped in XML-style tags built EXACTLY as follows.
-
-- Opening tag: the character '<' + the word 'tool' + the characters '_call' + '>'.
-- Closing tag: the characters '</' + the word 'tool' + the characters '_call' + '>'.
-
-So every tool invocation looks like (spelling the tags out):
-OPENTAG newline JSON newline CLOSETAG, where OPENTAG is '<'+'tool'+'_call'+'>' and
-CLOSETAG is '</'+'tool'+'_call'+'>'. Write the tags as literal text characters.
-
-IMPORTANT: the opening tag ENDS with the '>' character. The exact character
-sequence is: less-than sign, t, o, o, l, underscore, c, a, l, l, greater-than
-sign. The '>' must come IMMEDIATELY after the second 'l', with no newline and
-no space before it. Only AFTER the '>' do you start a new line with the JSON.
-Emit the opening tag exactly once per call, never twice.
-
-Never output a bare JSON object without these tags. Never use any other tag name.
-The JSON has the form {"name": "<name of tool>", "arguments": { ... }}.
-One JSON object per tag pair. Output nothing else around the call.
-
-Common mistakes you MUST avoid, on EVERY step of the conversation (including
-after you have received tool results):
-- WRONG: writing the opening tag but stopping before the '>' (e.g. a line that
-  ends after the second 'l'). The tag is INVALID without its final '>'.
-- WRONG: writing the opening tag twice in a row.
-- WRONG: outputting the JSON with no tags at all.
-If your previous message in this conversation contains one of these mistakes,
-do NOT imitate it. Emit the correct, complete tags every single time.
+```
+<tool_call>
+<function=read_file>
+<parameter=path>
+/etc/hostname
+</parameter>
+</function>
+</tool_call>
 ```
 
-The same content is kept in section 8.3 of the coding-agents guide that ships
-with the service (`$AISESSION_HOME/ai-session/CODING_AGENTS.md`).
+An `AGENTS.md` file that asks for a hand-written format instead tells the model to produce
+something that is not its native output. `AGENTS.md` remains useful for ordinary project
+instructions; it is only the tool-call workaround that must go.
 
 ### Run
 
@@ -214,23 +181,23 @@ Sanity-check the configuration before spending tokens, then run opencode inside
 your git repository:
 
 ```bash
-opencode models   # must list exactly one model: rcc/qwen2.5_coder_32B
+opencode models   # must list exactly one model: rcc/qwen3.8_27B
 opencode
 ```
 
-If opencode prints tool-call JSON as ordinary chat text instead of acting on it,
-re-issue the instruction (in the verification this occurred in 1 of 4 task runs);
-if it recurs persistently, check that `AGENTS.md` is present and switch to
-[aider](aider.md) if needed. See also [Troubleshooting](../troubleshooting.md).
+If opencode occasionally prints tool-call JSON as ordinary chat text instead of acting on
+it, re-issue the instruction. If it happens on every turn, check that the session was
+started with `--agent` and that you have no leftover `AGENTS.md` workaround file; switch to
+[aider](aider.md) if it persists. See also [Troubleshooting](../troubleshooting.md).
 
-### Seeing the model's reasoning (Qwen3 only)
+### Seeing the model's reasoning
 
-The Qwen3 models think before answering. Served with `--reasoning-parser qwen3`,
+The Qwen3-family models think before answering. Served with `--reasoning-parser qwen3`,
 their chain of thought comes back in a separate `reasoning_content` field, kept
 out of the answer (see [Command Reference](../reference.md)). opencode reads that
 field and displays it as a **Thinking** block, but the display is off by default.
 
-To use it, start a Qwen3 session and point opencode at that model:
+To use it, start a thinking session and point opencode at that model:
 
 ```bash
 ai-session code --model qwen3_4b --agent           # serve a thinking model
@@ -238,22 +205,20 @@ ai-session code --model qwen3_4b --agent           # serve a thinking model
 opencode run --thinking --model rcc/qwen3_4b "…"   # prints a "Thinking: …" block, then the answer
 ```
 
-The interactive TUI shows the thinking block inline above each reply. Only the
-Qwen3 models reason this way (`qwen3_4b` and the larger `qwen3_32B`, both served);
-the default `qwen2.5_coder_32B` and the Qwen2.5/Llama models do not think, so
-`--thinking` has no effect with them. aider, by contrast, does not surface
-`reasoning_content` against this endpoint — it shows only the answer.
+The interactive TUI shows the thinking block inline above each reply. `qwen3_4b` and the
+coding default `qwen3.8_27B` reason this way by default. `gemma4_31B` can, but only when you
+ask for it per request; the Qwen2.5 models do not think at all, so `--thinking` has no
+effect with them. aider, by contrast, does not surface `reasoning_content` against this
+endpoint — it shows only the answer.
 
 ## Cline
 
 Cline is a VS Code extension in the same class of tool: an autonomous agent driven
 by native tool calling. Configure it with the same three values — base URL
 `http://localhost:<GW_PORT>/v1`, API key the session access key, model
-`qwen2.5_coder_32B` — against a session started with `ai-session code --agent`.
-Cline has not been **tested** yet. The missing `<tool_call>` marker
-tokens (see Step 2) are a property of the served model, not of opencode, so Cline
-is expected to need an equivalent rules file; its mechanism is `.clinerules`
-rather than `AGENTS.md`. aider is the fallback.
+`qwen3.8_27B` — against a session started with `ai-session code --agent`.
+Cline has not been **tested** against this service; nothing is known to be wrong with it,
+but nothing has been verified either. aider is the fallback.
 
 ## Step 3: Stop the session
 

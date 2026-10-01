@@ -84,49 +84,50 @@ the preset's default.
 
 | Preset | Model key | Weights | Use | Context (tokens) | GPUs it runs on | License |
 |---|---|---|---|---:|---|---|
-| `code` | `qwen2.5_coder_32B` | Qwen2.5-Coder-32B-Instruct | Coding | 32768 | 2 x A100-80GB | Apache-2.0 |
+| `code` | `qwen3.8_27B` | Qwen3.8-27B | Coding (default) | 32768 | 2 x A100 | Apache-2.0 |
+| `code --model gemma4_31B` | `gemma4_31B` | Gemma-4-31B-it | Coding (alternative) | 32768 | 2 x A40 or A100 | Apache-2.0 |
 | `chat` | `qwen2.5_72B` | Qwen2.5-72B-Instruct | General chat | 8192 | 4 x A100-80GB | Qwen (Tongyi) community license |
 | `fast` | `qwen3_4b` | Qwen3-4B | Small and fast; lowest cost | 8192 | 1 x A100 | Apache-2.0 |
 
 A good practice is to start small and scale up: prototype your prompts,
 scripts, or agent setup against `ai-session fast` — the small model loads
 quickest, waits least for free GPUs, and has the lowest floor cost (1.0 SU per
-hour) — and move to the coder or 72B model once the workflow works. The larger
+hour) — and move to a coding model or the 72B once the workflow works. The larger
 models are more capable, and switching requires no change to the client
 configuration.
 
-A Qwen3-32B checkpoint (Apache-2.0) is also available with `--model qwen3_32B`: a
-thinking model whose chain of thought is returned separately from the answer,
-served on two A100s. A Meta-Llama-3.1-70B-Instruct checkpoint (Llama 3.1 Community
-License plus an Acceptable Use Policy) is also available to any user with
-`--model llama3.1_70B`, once you record a one-time license acknowledgment (the
-Llama 3.1 Community License permits this use, with conditions; see
-[Model licenses](licenses.md)). A Qwen2.5-0.5B-Instruct
-checkpoint (Apache-2.0) is staged for smoke tests only and is not offered for user
-sessions.
+The default coding model is itself a thinking model: its chain of thought is returned
+separately from the answer, and reasoning depth is adjustable per request via
+`reasoning_effort` (`low`, `medium`, or `xhigh` — `xhigh` is the model's default). The
+second coding option, Gemma-4-31B, does not think unless you ask it to, which makes it
+cheaper and faster for routine work; it also runs on A40, the least expensive GPU tier
+here. Both accept images. Which to pick is covered on the
+[coding overview](coding/overview.md#choosing-between-the-two-coding-models).
+A Qwen2.5-0.5B-Instruct checkpoint (Apache-2.0) is staged for smoke tests only and is not
+offered for user sessions.
 
-Larger models are staged but not yet servable. Qwen3.5-122B-A10B (FP8) is
-registered and its weights are on disk; it becomes available once it passes
-validation on the cluster's H200 nodes. It is a vision-language model, so it
-will be the first served model to accept images alongside text. GLM-5.2 (FP8),
-a text-only model, is likewise registered with its weights on disk, but it
-needs multi-node H200 serving that is not yet built; GLM-5.1 comes later. The H200 hardware itself is already on the cluster;
-what is pending is the serving work, not the machines.
+One larger model is staged but not yet offered. Qwen3.5-122B-A10B is validated at two
+GPUs on both Hopper tiers and joins the served list once it has a measured billing rate.
+Note that its weights are FP8, which requires an H100 or H200 — it cannot run on A100 or
+A40 at all. Since Hopper nodes here belong to individual research groups, this model will
+only ever be startable by users whose group owns that hardware. Everything else the
+service offers runs on A100, which needs no special access.
 
 Guidance on choosing between the served models is on the
 [coding overview](coding/overview.md) page, and a rough capability frame of
 reference against closed "frontier" models is in the
-[Command Reference](reference.md#rough-capability-frame-of-reference). The license obligations that apply when
-you serve these models to other people — attribution for the Qwen 72B model, the
-acknowledgment gate for Llama — are set out on the [model licenses](licenses.md) page.
+[Command Reference](reference.md#rough-capability-frame-of-reference). Every model
+offered is Apache-2.0 except Qwen2.5-72B, which carries an attribution obligation when
+you serve it to other people; the details are on the
+[model licenses](licenses.md) page.
 
 !!! note "GPU nodes have no internet access"
     Only pre-staged models can be served; a session cannot download weights. New
-    models are staged by the users on request.
+    models are staged by RCC staff on request.
 
 ## What it costs, in one line
 
-One SU equals one A100-GPU-hour, and the default coding session (Qwen2.5-Coder-32B
+One SU equals one A100-GPU-hour, and the default coding session (Qwen3.8-27B
 on 2 x A100) costs 2.0 SU per hour held. A session is billed the greater of its
 metered token work and a reservation floor — the weighted cost of the GPUs held
 for the session's wall-clock lifetime, whether or not you are actively using them.

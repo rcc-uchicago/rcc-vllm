@@ -99,20 +99,18 @@ habits that keep a mistake small.
 | Point the agent at the narrowest directory that works | Limits both what an injection can reach and what a wrong edit can damage. |
 | Do not run a write-or-execute-capable agent unattended on untrusted input | Prompt injection executes with your permissions; supervision is the mitigation. |
 
-## Tool calling and the coder model
+## Tool calling
 
-Agents that use native tool calling depend on the served model emitting
-structured tool calls the serving engine can parse. The engine's `hermes` tool-call parser does
-**not** populate `tool_calls` for Qwen2.5-Coder-32B-Instruct (a known upstream
-issue in the serving software,
-[#29192](https://github.com/vllm-project/vllm/issues/29192)): the tool JSON
-streams back as ordinary text and the agent silently does nothing, with no error
-on either side. Use `qwen2.5_72B` or `qwen3_4b` for any agent, MCP, or
-tool-calling workload; both emit tool calls the parser matches. The coder model
-remains the right default for [aider](aider.md), which drives edits through the
-chat-completions API without native tool calling. See
-[opencode and Cline](opencode.md) for the workaround that makes the coder model
-usable with tool-calling agents, and why it is fragile.
+Agents that use native tool calling depend on the served model emitting structured tool
+calls the serving engine can parse. Every served model does: the coding default
+`qwen3.8_27B` is suitable for agent, MCP, and tool-calling work, and `gemma4_31B`,
+`qwen2.5_72B`, and `qwen3_4b` all work too. The launcher selects the tool-call parser that
+matches the model you serve, so there is nothing to configure. Start the session with
+`ai-session code --agent`; without that flag the session accepts no tool calls at all.
+
+[aider](aider.md) does not need any of this — it drives edits through the chat-completions
+API as text diffs, without native tool calling, and works against a session started either
+way.
 
 ## Build your own agent
 
@@ -122,8 +120,8 @@ gateway speaks the standard OpenAI API format that most AI tools can talk to,
 any framework that targets an OpenAI-compatible endpoint works: point
 it at your session's base URL (`http://localhost:<GW_PORT>/v1`), pass the session
 access key as the API key, and set the model name to the key your session serves
-(`qwen2.5_72B`, `qwen3_4b`, or another served model). Frameworks verified to fit
-this shape include:
+(any served model — `qwen3.8_27B`, `gemma4_31B`, `qwen2.5_72B`, or `qwen3_4b`).
+Frameworks verified to fit this shape include:
 
 - **PydanticAI** — typed Python agents; the example below uses it.
 - **LangGraph** — graph-structured agent workflows.
@@ -144,9 +142,9 @@ Start a session with tool calling enabled, install the framework into your own
 virtual environment on a login node, then run the example:
 
 ```bash
-# 1. Start a tool-calling session (login node, in tmux or screen). Serve the
-#    72B, not the coder default -- the coder model does not emit tool calls (see
-#    the caveat above), so an agent pointed at it would silently do nothing.
+# 1. Start a tool-calling session (login node, in tmux or screen). Any served
+#    model works; the example defaults to the 72B, and the coding default
+#    qwen3.8_27B is equally valid.
 ai-session code --agent --model qwen2.5_72B
 
 # 2. Create your own venv and install the framework (login node, has internet):
@@ -158,13 +156,6 @@ pip install pydantic-ai
 eval "$(ai-session env)"
 python "$AISESSION_HOME/examples/agent_pydantic.py"
 ```
-
-!!! warning "Default to qwen2.5_72B, not the coder model"
-    The example defaults to `MODEL=qwen2.5_72B` on purpose. As above, native
-    tool calling fails silently on Qwen2.5-Coder-32B (upstream issue #29192,
-    described above); a custom
-    agent pointed at the coder model will appear to run but never call your
-    tools.
 
 Everything in this page applies to an agent you build yourself: it runs with
 your permissions, spends your SU, and is your responsibility.

@@ -36,7 +36,7 @@ Job-queue server, all queries scoped to you:
 |---|---|---|
 | `my_jobs` | `states` (optional, e.g. `RUNNING,PENDING`) | `squeue --me` |
 | `job_detail` | `job_id` (required, e.g. `12345` or array task `12345_6`) | `sacct -j <id>`, after verifying you own the job |
-| `partition_info` | `partition` (optional, e.g. `gpu` or `gpu,test`) | `sinfo` |
+| `partition_info` | `partition` (optional, e.g. `gpu` or `gpu,beagle3`) | `sinfo` |
 
 SU-usage server, reading the billing artifacts:
 
@@ -107,17 +107,16 @@ whatever form their configuration uses to declare a local stdio server.
 
 ## Serve a model that can call tools
 
-An MCP tool is invoked through the model's native tool calling, so the session
-must serve a model that emits tool calls reliably. Use `qwen2.5_72B` or
-`qwen3_4b`, not the default coder model: the served Qwen2.5-Coder-32B checkpoint
-does not emit the tool-call markers the server expects (a known upstream issue),
-so a coder session will not reliably trigger these tools even though the
-configuration is correct. Start the session with tool calling enabled and the 72B
-model:
+An MCP tool is invoked through the model's native tool calling, so the session must serve a
+model that emits tool calls reliably, and it must be started with tool calling enabled.
+Every served model qualifies: the coding default `qwen3.8_27B` is the recommended choice,
+and `gemma4_31B`, `qwen2.5_72B`, and `qwen3_4b` all work. Start the session with `--agent`:
 
 ```bash
-ai-session code --agent --model qwen2.5_72B
+ai-session code --agent
 ```
+
+Add `--model KEY` to serve one of the others.
 
 ## Check a server by hand
 

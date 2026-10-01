@@ -42,7 +42,7 @@ ai-session code
 ```
 
 The command starts the model server on cluster GPUs, waits until the model is
-loaded (typically several minutes for the default 32B model), starts the gateway,
+loaded (typically several minutes for the default 27B model), starts the gateway,
 and prints a block containing the session's port, the exact aider command, and the
 SSH tunnel command for laptop access. Leave this terminal running.
 
@@ -65,7 +65,7 @@ Verification — the command ends with a READY banner of this form:
 ==> [2/2] starting gateway on 127.0.0.1:<GW_PORT>
     gateway healthy (pid <PID>)  log: .../run/gateway.log
 
-================ READY -- code with the local qwen2.5_coder_32B (ctx 32768) ================
+================ READY -- code with the local qwen3.8_27B (ctx 32768) ================
 ```
 
 followed by the aider command to copy, the connection parameters for other
@@ -134,12 +134,12 @@ values and ready-to-paste setup for every client.
 |---|---|
 | Base URL | `$AISESSION_BASE_URL` — `http://localhost:<GW_PORT>/v1`; the port is derived from your numeric user ID (`8400 + UID % 90`), so it differs per user |
 | API key | `$AISESSION_API_KEY` — the session access key (see below) |
-| Model name | `qwen2.5_coder_32B` (default) or `qwen2.5_72B`; must equal the model you started |
+| Model name | `qwen3.8_27B` (default), or `gemma4_31B` / `qwen2.5_72B` / `qwen3_4b`; must equal the model you started |
 | Context window | 32768 tokens for coding sessions (8192 for chat sessions) |
 
 The model name is the identifier the server exposes. Clients that route through
 litellm (aider, Continue) prefix it with `openai/` to select the standard
-format, for example `openai/qwen2.5_coder_32B`.
+format, for example `openai/qwen3.8_27B`.
 
 ### The session access key
 
@@ -187,26 +187,28 @@ same `localhost` URL directly. For what an SSH tunnel is and how to debug one, s
 
 ## Choosing a model
 
-The default is `qwen2.5_coder_32B` (Qwen2.5-Coder-32B-Instruct). To serve the
-general 72B model instead, run `ai-session code --model qwen2.5_72B`; the right
-GPU configuration is chosen for you. For light work — debugging, quick questions,
-or simple edits where you want the cheapest session — serve the small `qwen3_4b`
-on a single GPU with `ai-session code --model qwen3_4b`; it holds one GPU at the
-1.0 SU/h floor and, unlike the coder model, emits native tool calls reliably, so
-it is also the small option for `--agent` clients and MCP tools (see
-[opencode and Cline](opencode.md) and [Agent responsibilities](agents.md)).
-For a coding model that reasons before answering, serve `qwen3_32B`
-(`ai-session code --model qwen3_32B`): a Qwen3 thinking model on two A100s whose
-chain of thought is returned separately from the answer — visible in opencode with
-`--thinking` (see [opencode](opencode.md#seeing-the-models-reasoning-qwen3-only)).
+The `code` preset serves `qwen3.8_27B` (Qwen3.8-27B). Three other served models are
+reachable with `--model`:
+
+- `ai-session code --model gemma4_31B` — the second coding option, and the cheapest capable
+  one. See [Choosing between the two coding models](#choosing-between-the-two-coding-models).
+- `ai-session code --model qwen3_4b` — the small model, for debugging, quick questions, or
+  simple edits. It holds one GPU at the 1.0 SU/h floor, and it is the cheapest option for
+  `--agent` clients and MCP tools (see [opencode and Cline](opencode.md) and
+  [Agent responsibilities](agents.md)).
+- `ai-session code --model qwen2.5_72B` — the general 72B model, for mixed code-and-prose
+  work or when the larger general model is specifically wanted. It is also the model behind
+  the web interface.
+
+The right GPU configuration is chosen for you in each case.
 
 | Model key | Parameters | GPUs it runs on | Prefill (tok/s) | Decode (tok/s) | Reservation floor |
-|---|---|---|---:|---:|---:|
-| `qwen3_4b` (cheapest; debugging, simple edits, tool calling) | 4B | 1 x A100-80GB | — | — | 1.0 SU/h |
-| `qwen2.5_coder_32B` (default) | 32B | 2 x A100-80GB | 4773 | 1679 | 2.0 SU/h |
-| `qwen3_32B` (thinking; reasons before editing) | 32B | 2 x A100-80GB | — | — | 2.0 SU/h |
-| `qwen2.5_72B` | 72B | 4 x A100-80GB | 2901 | 1123 | 4.0 SU/h |
-| `qwen2.5_72B` (H200 option) | 72B | 2 x H200 | 7594 | 2329 | 6.0 SU/h |
+|---|---|---:|---:|---:|---:|
+| `qwen3_4b` (cheapest; debugging, simple edits, tool calling) | 4B | 1 x A100-80GB | 22167 | 5114 | 1.0 SU/h |
+| `qwen3.8_27B` (default; thinking model, accepts images) | 27.8B | 2 x A100 | — | — | 2.0 SU/h |
+| `gemma4_31B` (alternative; thinking off by default) | 30.7B | 2 x A40 | 2301 | 349 | 1.0 SU/h |
+| `gemma4_31B` (on A100 40GB — slower *and* dearer, see below) | 30.7B | 2 x A100 | 3337 | 336 | 2.0 SU/h |
+| `qwen2.5_72B` | 72B | 4 x A100-80GB | 2914 | 1191 | 4.0 SU/h |
 
 Throughput figures are aggregate, measured by the billing benchmark at concurrency
 64 over prefill-heavy, decode-heavy, and balanced request mixes.
@@ -214,23 +216,83 @@ They are the basis of the per-token charge, not the latency one user perceives
 (next section). The reservation floor is the minimum charge for a session — the
 GPU-type weight times the number of GPUs times the hours held; a session bills the
 larger of the metered token work and this floor. The canonical rate table and the
-full formula are on [Billing and Service Units](../billing.md).
-
-The coder model is the default because it is specialized for code, uses half the
-GPUs of the 72B, and has a lower measured per-token cost than the 72B at every
-benchmarked configuration. The 72B is preferable for mixed code-and-prose work or
-when the larger general model is specifically wanted. The H200 configuration
-(faster, higher floor) and other advanced serving overrides are handled by
-RCC staff; ask them, or see the staff guide in the repository.
+full formula are on [Billing and Service Units](../billing.md). Advanced serving
+overrides are handled by RCC staff; ask them, or see the staff guide in the repository.
 
 !!! warning "Each of these starts a billed GPU reservation"
     The floors above apply from the moment the session starts. Stop with
     `ai-session stop`.
 
+### Choosing between the two coding models
+
+Both are Apache-2.0, both handle tool calling, both accept images. They differ in how they
+spend your GPU time.
+
+| | `qwen3.8_27B` (default) | `gemma4_31B` |
+|---|---|---|
+| size | 27.8B, 51.8 GiB | 30.7B, 58.3 GiB |
+| thinking | **on by default** (`reasoning_effort` low/medium/xhigh) | **off by default**, opt-in |
+| runs on | A100, H100 | A40, A100 |
+| cheapest floor | 2.0 SU/h (2 × A100) | **1.0 SU/h** (2 × A40) |
+| our code benchmark | 50.0% | **66.7%** |
+
+**Start with the default.** `qwen3.8_27B` is the `code` preset and reasons before answering,
+which suits hard problems.
+
+**Reach for `gemma4_31B`** when you want cheaper, faster turnaround. It scored higher on our
+own frozen coding benchmark and its A40 configuration is the least expensive way to run a
+capable coding model here.
+
+!!! warning "The two benchmark figures are not like-for-like"
+    Both were measured on the same frozen 60-problem subset with the same harness and the
+    same greedy decode — but with thinking *disabled*. That is Gemma's own default mode; it
+    is not Qwen's, whose default is `reasoning_effort: xhigh`. So 50.0% is a lower bound for
+    `qwen3.8_27B` and the 16.7-point gap flatters Gemma. Wherever you see the two numbers
+    together, read them with this caveat.
+
+!!! tip "For `gemma4_31B`, prefer A40 over A100 — it is faster *and* cheaper"
+    This inverts the usual ordering, so it is worth stating plainly. Measured at TP=2:
+
+    | | 2 × A40 | 2 × A100 40GB |
+    |---|---|---|
+    | decode | **349 tok/s** | 336 tok/s |
+    | KV cache | **9.17 GiB** (51,325 tokens) | 4.71 GiB (26,342 tokens) |
+    | cost per 1k output tokens | **0.000797 SU** | 0.001652 SU |
+    | reservation floor | **1.0 SU/h** | 2.0 SU/h |
+
+    An A40 card is 46 GiB against a 40 GiB A100, and this model needs 30.4 GiB per GPU — so
+    the A40 has roughly double the room left for cache. That lets it keep more requests in
+    flight, which more than offsets its slower silicon. Combined with half the GPU-tier
+    charge, A40 works out **2.1× cheaper per token**. Pass `CONSTRAINT=a40` to pin it.
+
+```bash
+ai-session code --model gemma4_31B
+```
+
+Gemma can think if you ask it to, per request:
+
+```json
+{"chat_template_kwargs": {"enable_thinking": true}}
+```
+
+We measured what that costs: **5–12× the tokens and 5–12× the wall time**, with no
+improvement on the two problems we tried. Under GPU-time billing that is a 5–12× cost
+multiplier, so leave it off unless a problem genuinely needs it.
+
+!!! note "`qwen3.8_27B`: floor billing, and a word about thinking"
+    The coding default has a measured rate for the H100 tier but not for A100, which
+    is where it runs by default. Until an A100 record is measured, its sessions bill the
+    **reservation floor** for the GPUs held — 2.0 SU/hour — with no token-metered
+    component. Budget on wall-clock, not on tokens.
+
+    Separately: this model thinks by default at `reasoning_effort: xhigh`, which can
+    generate a large number of reasoning tokens and hold the GPU longer than you expect.
+    Pass `low` or `medium` for routine edits; keep `xhigh` for genuinely hard problems.
+
 ## Context window and prompt sizing
 
-Coding sessions serve a 32768-token context. This is the native context length of
-the Qwen2.5 models; no rope/YaRN scaling is applied. Chat sessions default
+Coding sessions serve a 32768-token context, within the native context length of
+every coding model offered; no rope/YaRN scaling is applied. Chat sessions default
 to 8192.
 
 The aider metadata file declares the split as 28000 input tokens and 4096 output
@@ -238,11 +300,10 @@ tokens, leaving headroom so that prompt plus generated tokens cannot exceed
 32768. If your added files exceed the input budget, aider reports the prompt as
 too long; see [Troubleshooting](../troubleshooting.md).
 
-Single-stream generation latency for the 32B is approximately 66 ms per output
-token (measured median time-per-output-token, same benchmark as above), i.e. on
-the order of 15 tokens per second as perceived by one interactive user. The
-aggregate throughput figures in the table above are higher because they sum
-across 64 concurrent requests.
+Single-stream generation latency on a two-GPU coding session is on the order of tens
+of milliseconds per output token — roughly 15 to 30 tokens per second as perceived by one
+interactive user. The aggregate throughput figures in the table above are much higher
+because they sum across 64 concurrent requests.
 
 ## Build your own agent
 
@@ -251,14 +312,11 @@ exposes the OpenAI chat-completions protocol at the session URL, you can write
 your own agent in any framework that speaks the standard format (PydanticAI,
 LangGraph, smolagents, or the OpenAI Agents SDK), pointing it at
 `$AISESSION_BASE_URL` with
-`$AISESSION_API_KEY` as the API key and a served model name (`qwen2.5_72B` or
-`qwen3_4b` for tool calling). A runnable, self-contained PydanticAI example ships
-with the service; the [Build your own agent](agents.md#build-your-own-agent)
-section walks through it.
+`$AISESSION_API_KEY` as the API key and a served model name. A runnable,
+self-contained PydanticAI example ships with the service; the
+[Build your own agent](agents.md#build-your-own-agent) section walks through it.
 
-Use `qwen2.5_72B` or `qwen3_4b`, not the coder model, for any tool-calling
-agent: the server's tool-call parser does not populate `tool_calls` for
-Qwen2.5-Coder-32B (model-server bug #29192), so a custom agent pointed at the
-coder model runs but never calls your tools. Before running an autonomous agent, read
-[Agent responsibilities and risks](agents.md): it acts with your full cluster
-permissions and its actions are your responsibility.
+Every served model populates `tool_calls` correctly, so any of them works as the reasoning
+engine for a tool-calling agent; pick on capability and cost as above. Before running an
+autonomous agent, read [Agent responsibilities and risks](agents.md): it acts with your full
+cluster permissions and its actions are your responsibility.

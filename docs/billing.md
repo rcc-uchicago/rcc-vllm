@@ -40,9 +40,9 @@ adjust them in the policy file.
 | A40       | 0.5   | NCSA Delta discounted tier; TFLOPS ratio 0.48, price ratio 0.50 |
 
 The A100 tier is not split by memory size: the 40 GB and 80 GB cards both bill
-1.0. The A100 sessions this service starts run on 80 GB nodes; the `qwen3_4b`
-rate record was measured on a 40 GB PCIe card (see the provenance below), and
-both normalize to the same `a100` tier.
+1.0. Both sizes are in service — the `gemma4_31B` a100 record was measured on a 40 GB
+PCIe card and the `qwen2.5_72B` and `qwen3_4b` records on 80 GB cards (see the
+provenance below) — and both normalize to the same `a100` tier.
 
 The table is synthesized from the peer conventions at NCSA Delta, PSC Bridges-2,
 TACC Lonestar6, Harvard FASRC, Caltech, and MSI, cross-checked against dense-BF16
@@ -105,40 +105,52 @@ hand-set.** Prefill (reading your prompt) is compute-bound and fast; decode
 (generating the reply) is memory-bandwidth-bound and slow, so `decode_tps` is well
 below `prefill_tps`. Each output token therefore costs
 `alpha = prefill_tps / decode_tps` times an input token. The measured alpha ranges
-from 2.1 (Qwen2.5-72B on H100) to 4.9 (Qwen3-4B on A100) across the benchmarked
+from 2.1 (Qwen2.5-72B on H100) to 9.9 (Gemma-4-31B on A100) across the benchmarked
 configurations below. Commercial APIs price output 5-6 times input for the same
 physical reason.
 
 ## Measured rates
 
-The rate table holds one record per model-and-GPU configuration. Five records are
-populated (`billing/rate_table.json`, last updated 2026-06-10). The floor column
-is `w_gpu * N`, the SU cost per hour of holding that configuration.
+The rate table holds one record per model-and-GPU configuration
+(`billing/rate_table.json`). The floor column is `w_gpu * N`, the SU cost per hour of
+holding that configuration.
 
-| Model key           | GPU type | GPUs (N) | Prefill (tok/s) | Decode (tok/s) | Floor (SU/h) |
-|---------------------|----------|---------:|----------------:|---------------:|-------------:|
-| `qwen2.5_72B`       | a100     |        4 |         2901.16 |        1122.71 |          4.0 |
-| `qwen2.5_72B`       | h100     |        4 |         3787.33 |        1810.50 |          8.0 |
-| `qwen2.5_72B`       | h200     |        2 |         7593.69 |        2328.72 |          6.0 |
-| `qwen2.5_coder_32B` | a100     |        2 |         4772.81 |        1679.03 |          2.0 |
-| `qwen3_4b`          | a100     |        1 |        20063.28 |        4128.74 |          1.0 |
+| Model key      | GPU type | GPUs (N) | Prefill (tok/s) | Decode (tok/s) | Floor (SU/h) | Server |
+|----------------|----------|---------:|----------------:|---------------:|-------------:|--------|
+| `qwen2.5_72B`  | a100     |        4 |         2913.57 |        1191.43 |          4.0 | 0.26.0 |
+| `qwen2.5_72B`  | h100     |        4 |         3787.33 |        1810.50 |          8.0 | 0.10.2 |
+| `qwen3.8_27B`  | h100     |        2 |        11827.90 |        3492.74 |          4.0 | 0.26.0 |
+| `gemma4_31B`   | a40      |        2 |         2301.17 |         348.67 |          1.0 | 0.26.0 |
+| `gemma4_31B`   | a100     |        2 |         3336.88 |         336.21 |          2.0 | 0.26.0 |
+| `qwen3_4b`     | a100     |        1 |        22166.80 |        5113.82 |          1.0 | 0.26.0 |
 
-Provenance: all five records were benchmarked with the model server (vLLM 0.10.2) at dtype bfloat16, at
-concurrency 64 over three request profiles (prefill-heavy, decode-heavy, balanced),
-using the same serve flags production uses. Nodes and dates: the two a100 80 GB
-records on midway3-0377 (Qwen2.5-72B on 2026-06-02, Qwen2.5-Coder-32B on
-2026-06-10), h100 (H100 NVL) on midway3-0426 on 2026-06-02, h200 on midway3-0605 on
-2026-06-02, and the qwen3_4b anchor on an A100-PCIE-40GB on midway3-0294 on
-2026-06-02. Each record in the rate table carries the full provenance block (GPU
-name, node, serve flags, profile parameters, a metrics cross-check, timestamp).
+Provenance. A record is only valid for the model-server version it was measured under; if
+the running server reports a different version, the token term is dropped and the session
+bills the floor rather than being charged against a stale number. The 0.26.0 records were
+measured on 2026-08-19 and 2026-08-20: `gemma4_31B` on beagle3-0010 (A100 40 GB) and
+beagle3-0031 (A40), `qwen2.5_72B` and `qwen3_4b` on midway3-0377/0378 (A100 80 GB), and
+`qwen3.8_27B` on midway3-0423 (H100 NVL). The `qwen2.5_72B` h100 row was measured in June
+2026 under 0.10.2 and therefore no longer applies to a running session; it is kept as
+measurement provenance.
+
+Note the two `gemma4_31B` rows: **A40 is both the faster and the cheaper tier for this
+model**, which inverts the usual ordering. The reasoning is on
+[Coding Sessions](coding/overview.md#choosing-between-the-two-coding-models).
+
+One current gap. `qwen3.8_27B` runs on **A100** by default but its record is for h100, so
+coding sessions on the default configuration bill the floor until an a100 record is
+measured.
+
+Each record in the rate table carries a full provenance block (GPU name, node, serve
+flags, profile parameters, a metrics cross-check, timestamp).
 
 These are aggregate throughputs at concurrency 64, the basis for the token charge —
 not the single-stream speed one interactive user perceives. Session start commands
 and model choice are covered in [Coding Sessions](coding/overview.md) and
 [Getting Started](getting-started.md).
 
-Models without a measured record — `qwen3_32B` today, and the roadmap models
-(`qwen3.5_122B`, GLM-5.1 / GLM-5.2) when they arrive — are billed on the
+A model-and-GPU configuration without a measured record — `qwen3.8_27B` on A100, which
+is the default coding configuration, and `qwen3.5_122B` when it arrives — is billed on the
 reservation floor alone (`w_gpu × N × hours`), with no token term. The floor is the
 authoritative, dominant charge for interactive sessions in any case; a measured
 token rate is added later if a model is benchmarked. A rate record is only used
@@ -156,7 +168,7 @@ rates in the table above.
 
 | Configuration           | w_gpu x N | Token term (one request) | 2 h floor | Billed  |
 |-------------------------|----------:|-------------------------:|----------:|--------:|
-| Qwen2.5-72B, 2 x H200   |       6.0 |                0.0008 SU |   12.0 SU | 12.0 SU |
+| Qwen2.5-72B, 2 x H200 *(illustrative; H200 not available)* | 6.0 |     0.0008 SU |   12.0 SU | 12.0 SU |
 | Qwen2.5-72B, 4 x A100   |       4.0 |                0.0013 SU |    8.0 SU |  8.0 SU |
 
 The floor is the charge; the token term is a rounding error, about one
@@ -164,10 +176,16 @@ ten-thousandth of the bill, for a single request. The H200 session costs more th
 the A100 session for the same work because it costs more to hold — the intended
 behavior of the type multiplier.
 
-The everyday number: the default coding session (`qwen2.5_coder_32B` on two A100s)
-costs **2.0 SU per hour held**. A three-hour afternoon of coding is 6.0 SU
-regardless of how many requests you send, unless your request volume is high enough
-for the token term to exceed the floor.
+The everyday number: a coding session on two GPUs costs **2.0 SU per hour held** on
+A100s. A three-hour afternoon of coding is 6.0 SU regardless of how many requests you
+send, unless your request volume is high enough for the token term to exceed the floor.
+
+The coding default `qwen3.8_27B` runs on two A100s, so that 2.0 SU/h floor is what a
+coding session holds. Its measured rate record is for the H100 tier, not A100, so an A100
+coding session bills the **reservation floor only** — GPU time held, with no token-metered
+component. An `a100` record is outstanding. In practice the floor dominates interactive
+coding anyway, so the effect on a typical session is small. The cheapest capable coding
+configuration is `gemma4_31B` on two A40s, at a 1.0 SU/h floor.
 
 ## Edge cases
 
