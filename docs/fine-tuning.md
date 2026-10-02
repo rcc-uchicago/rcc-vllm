@@ -297,7 +297,7 @@ registered models, and GPU nodes have no internet, so to serve your trained mode
 through ai-session it must be staged like any other served model — copied into
 the model store and registered — which RCC staff do on request (see the staging
 note on the [home page](index.md#available-models)). Keep the tokenizer and chat
-template with the checkpoint so it serves and bills like the model it was trained
+template with the checkpoint so it serves like the model it was trained
 from. Until it is staged, you can serve it yourself with your own vLLM on your own
 allocation.
 

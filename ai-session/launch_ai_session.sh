@@ -12,6 +12,7 @@
 #   MODEL_KEY MODEL_PATH TP CONSTRAINT GRES ACCOUNT PARTITION TIME_LIMIT
 #   CPUS MEM MAX_MODEL_LEN GPU_MEM_UTIL ENFORCE_EAGER PORT
 #   ENABLE_LORA LORA_MODULES MAX_LORA_RANK    (fine-tuned adapter serving)
+#   DEVICE JOB_NAME SERVED_MODEL_NAME          (CPU smoke runs; see below)
 #
 # Standalone example:
 #   ./launch_ai_session.sh --model-key qwen2.5_72B \
@@ -49,6 +50,17 @@ ENABLE_LORA=${ENABLE_LORA:-0}
 LORA_MODULES=${LORA_MODULES:-}      # space-separated name=/abs/path pairs (no spaces in paths)
 MAX_LORA_RANK=${MAX_LORA_RANK:-16}  # must be >= the largest adapter r; CLI computes this
 PORT=${PORT:-}
+# DEVICE=cpu (`ai-session <verb> --cpu`) serves qwen2.5_0.5B on a CPU-only node
+# (e.g. the `amd` or `caslake` partition) with the vLLM CPU build (env vllm-cpu,
+# built by tools/build_vllm_cpu.sbatch). No --gres/--constraint is requested and
+# no GPU-SU is billed; it is for trying the service and testing client wiring.
+DEVICE=${DEVICE:-gpu}
+CPU_KVCACHE_GIB=${CPU_KVCACHE_GIB:-8}
+# Smoke/benchmark fences (CLAUDE.md): a job named '<registry-key>:<port>' is billed
+# by billing_sweep.py and picked up by discovery, and a served name equal to a
+# registry key looks like production. Both default to the production values.
+JOB_NAME=${JOB_NAME:-}
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
 
 # -- flag parsing (overrides env) ------------------------------------------- #
 while [ $# -gt 0 ]; do
@@ -106,6 +118,9 @@ mkdir -p "${LOGDIR}" "${HF_CACHE}" "${INDUCTOR_CACHE}"
 if [ -z "${PORT}" ]; then
   PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
 fi
+
+JOB_NAME="${JOB_NAME:-${MODEL_KEY}:${PORT}}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL_KEY}}"
 
 # Per-session backend API key. The vLLM /v1 endpoint binds --host 0.0.0.0 (the
 # gateway on the login node must reach it, and compute<->compute is routable), and
@@ -174,6 +189,34 @@ case "${MODEL_KEY}" in
     echo "[launch] model ${MODEL_KEY} requires vLLM 0.26.0; ENV_PATH=${ENV_PATH}" >&2
     ;;
 esac
+
+# CPU mode: GPU-only resources and flags are dropped; the KV cache is sized in
+# GiB of host RAM (VLLM_CPU_KVCACHE_SPACE) instead of a GPU memory fraction.
+SLURM_GPU_ARGS=(--constraint="${CONSTRAINT}" --gres="${GRES}")
+GPU_MEM_FLAG="--gpu-memory-utilization ${GPU_MEM_UTIL}"
+CPU_ENV_EXPORTS=""
+if [ "${DEVICE}" = "cpu" ]; then
+  # Same allow-list as server.CPU_SERVED (checked again here so a direct launcher
+  # call cannot park a large model on a CPU node).
+  case "${MODEL_KEY}" in
+    qwen2.5_0.5B) ;;
+    *) echo "ERROR: DEVICE=cpu serves only qwen2.5_0.5B (got ${MODEL_KEY})" >&2; exit 2 ;;
+  esac
+  ENV_PATH=/project/rcc/mehta5/conda-envs/vllm-cpu
+  SLURM_GPU_ARGS=()
+  GPU_MEM_FLAG=""
+  CONSTRAINT=cpu GRES="" TP=1
+  # env/lib first: the CPU build is compiled with gcc 13 and needs its libstdc++
+  # (GLIBCXX_3.4.29); el8's /lib64 copy is too old and the import fails.
+  CPU_ENV_EXPORTS="export VLLM_CPU_KVCACHE_SPACE=${CPU_KVCACHE_GIB} LD_LIBRARY_PATH=${ENV_PATH}/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+  # Bind OpenMP to exactly the CPUs Slurm granted. VLLM_CPU_OMP_THREADS_BIND=auto
+  # picked an EMPTY core list inside a partial-node allocation (job 59858393:
+  # "core ids=[]"), then set OMP_NUM_THREADS to an invalid value and the worker died.
+  CPU_ENV_EXPORTS="${CPU_ENV_EXPORTS}
+export VLLM_CPU_OMP_THREADS_BIND=\$(python -c 'import os; print(\",\".join(map(str, sorted(os.sched_getaffinity(0)))))')
+echo \"[job] VLLM_CPU_OMP_THREADS_BIND=\$VLLM_CPU_OMP_THREADS_BIND\" >&2"
+  echo "[launch] DEVICE=cpu: ENV_PATH=${ENV_PATH}, no GPU requested, KV cache ${CPU_KVCACHE_GIB} GiB" >&2
+fi
 
 AGENT_FLAGS=""
 if [ "${AGENT_CLIENT}" = "1" ]; then
@@ -255,13 +298,12 @@ JID=$(
   sbatch --parsable \
     --account="${ACCOUNT}" \
     --partition="${PARTITION}" \
-    --constraint="${CONSTRAINT}" \
-    --gres="${GRES}" \
+    "${SLURM_GPU_ARGS[@]}" \
     --cpus-per-task="${CPUS}" \
     --mem="${MEM}" \
     --time="${TIME_LIMIT}" \
     --nodes=1 --ntasks=1 \
-    --job-name "${MODEL_KEY}:${PORT}" \
+    --job-name "${JOB_NAME}" \
     --output "${LOGDIR}/${MODEL_KEY}-%j.out" \
     --error  "${LOGDIR}/${MODEL_KEY}-%j.err" \
     --export=ALL,HF_HOME=${HF_CACHE},HUGGINGFACE_HUB_CACHE=${HF_CACHE},TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE} \
@@ -282,6 +324,7 @@ mamba activate ${ENV_PATH}
 # checks paths under /v1, so /metrics and /health stay open for the metering
 # scrape and the readiness poll.
 export VLLM_API_KEY="${BACKEND_KEY}"
+${CPU_ENV_EXPORTS}
 
 # Production serve flags. A rate_table.json record is only valid for the exact serve
 # flags AND vLLM version it was measured under, so these must stay consistent with
@@ -293,14 +336,14 @@ export VLLM_API_KEY="${BACKEND_KEY}"
 # the metering scrape can reach it; /v1 is protected by VLLM_API_KEY above. Stats stay
 # ON so /metrics is populated.
 vllm serve ${MODEL_PATH} \
-  --served-model-name ${MODEL_KEY} \
+  --served-model-name ${SERVED_MODEL_NAME} \
   --host 0.0.0.0 \
   --port ${PORT} \
   --tensor-parallel-size ${TP} \
   --enable-prefix-caching \
   --trust-remote-code \
   --max-model-len ${MAX_MODEL_LEN} \
-  --gpu-memory-utilization ${GPU_MEM_UTIL} \
+  ${GPU_MEM_FLAG} \
   ${AGENT_FLAGS} \
   ${LORA_FLAGS} \
   ${REASONING_FLAG} \
@@ -316,9 +359,10 @@ echo "[launch] submitted jobid=${JID}" >&2
 # so ai_session can publish it to the gateway (upstream.json, 0600); ai_session
 # does NOT persist it in the on-disk session file. This line is captured by
 # ai_session (never echoed) and not written to any shared log.
-python3 - "$JID" "$PORT" "$MODEL_KEY" "$MODEL_PATH" "$CONSTRAINT" "$TP" "$GRES" "$ACCOUNT" "$PARTITION" "$SERVER_LOG" "$ENFORCE_EAGER" "$BACKEND_KEY" <<'PY'
+python3 - "$JID" "$PORT" "$MODEL_KEY" "$MODEL_PATH" "$CONSTRAINT" "$TP" "$GRES" "$ACCOUNT" "$PARTITION" "$SERVER_LOG" "$ENFORCE_EAGER" "$BACKEND_KEY" "$SERVED_MODEL_NAME" "$DEVICE" <<'PY'
 import json, sys
-(_, jid, port, mk, mp, constraint, tp, gres, acct, part, log, eager, backend_key) = sys.argv
+(_, jid, port, mk, mp, constraint, tp, gres, acct, part, log, eager, backend_key,
+ served, device) = sys.argv
 gpus = int(gres.split(":")[-1]) if ":" in gres else None
 print(json.dumps({
     "jobid": jid, "port": int(port), "model_key": mk, "model_path": mp,
@@ -326,5 +370,6 @@ print(json.dumps({
     "tp": int(tp), "gres": gres, "n_gpus_requested": gpus,
     "account": acct, "partition": part, "server_log": log,
     "enforce_eager": eager == "1", "backend_key": backend_key,
+    "served_model_name": served, "device": device,
 }))
 PY

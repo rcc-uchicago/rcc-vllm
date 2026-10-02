@@ -1,9 +1,19 @@
 # Billing and Service Units
 
+!!! note "What users see, since 2026-10-01"
+    `ai-session` now shows you the tokens each session consumed -- at
+    `ai-session stop` and again with `ai-session receipt` -- and no longer prints
+    SU estimates or charges, before or after a session. SU is still computed under
+    the policy below and recorded in the per-session summary JSON
+    (`~/.ai-session/state/logs/usage/<user>_<jobid>_<timestamp>_summary.json`) and
+    in the RCC staff ledger. RCC staff are revisiting this policy; the rest of this
+    page describes how SU is computed today, not what is shown to you.
+
 This page is the canonical statement of what an ai-session costs. It defines the
 Service Unit, gives the GPU-type multiplier table, states the charging formula,
 lists the measured throughput rates the formula uses, and shows how to read the
-charge you are billed. The machine-readable sources ship with the service
+usage receipt and the SU fields recorded in its summary file. The machine-readable
+sources ship with the service
 (`billing/billing_policy.yaml` for the policy numbers, `billing/rate_table.json`
 for the measured rates); the published rationale is in the service's
 `BILLING_POLICY.md`. How to start and stop sessions is documented on
@@ -80,9 +90,9 @@ running session cannot be given to anyone else — so you pay for the greater of
 work done and the hardware held, whether or not you were actively using it. This
 matches how Delta, NERSC, TACC, and PSC bill reserved GPU time.
 
-!!! warning "A running session consumes SU whether or not you send requests"
+!!! warning "A running session accrues SU whether or not you send requests"
     The floor accrues for every hour the session holds its GPUs, idle or busy.
-    Run `ai-session stop` as soon as you stop working.
+    It is recorded, not printed. Run `ai-session stop` as soon as you stop working.
 
 Two honest consequences of the max():
 
@@ -198,22 +208,22 @@ configuration is `gemma4_31B` on two A40s, at a 1.0 SU/h floor.
 
 ## Reading your usage summary
 
-`ai-session stop` meters the session and prints the itemized charge as its last
+`ai-session stop` meters the session and prints its token usage as its last
 output, so it cannot scroll off:
 
 ```text
 ==============================================================
-  SU CHARGE -- this session
-    BILLED : <billed_su> SU      basis=<floor|tokens>
-    model  : <model_key> on <n> x <GPU type> GPU   (weight <w> SU per GPU-hour)
-    usage  : held <hours> h   tokens in=<T_in> out=<T_out> (<n> requests)
-    session: <session id>
+  TOKEN USAGE -- this session
+    model  : <model_key> (<n> x <GPU type> GPU | cpu)
+    tokens : in=<T_in> out=<T_out> total=<T_in + T_out> (<n> requests)
+    session: <job id>
     receipt: <path to the summary JSON>
 ==============================================================
 ```
 
-The same data is written to a `*_summary.json` receipt file under your state
-directory. The summary contains:
+No SU figure is printed. The full record, including the SU computation, is written
+to the `*_summary.json` receipt file under your state directory
+(`~/.ai-session/state/logs/usage/`). The summary contains:
 
 | Field | Meaning |
 |-------|---------|
@@ -231,20 +241,20 @@ To re-print any past receipt, run this **on the login node**:
 ai-session receipt
 ```
 
-This renders your newest receipt; pass a specific summary-file path
-(`ai-session receipt <file>`) to render an older one. If there are no receipts it
-prints:
+This renders the token usage from your newest receipt; pass a specific
+summary-file path (`ai-session receipt <file>`) to render an older one. If there
+are no receipts it prints:
 
 ```text
-  SU CHARGE: none this run (no active session was billed).
+  TOKEN USAGE: none this run (no active session was ended).
 ```
 
-If a session fails before it is metered, or a charge looks wrong, see
+If a session fails before it is metered, or a token count looks wrong, see
 [Troubleshooting](troubleshooting.md).
 
 ## Central accounting (for staff)
 
-Your own receipt above is a convenience copy. Each session's charge is also
+Your own summary file above is a convenience copy. Each session's charge is also
 recorded to a staff-only ledger (`AISESSION_BILLING_DIR`), readable only by the
 `rcc-staff` group. Two records may exist per session: one written when you end the
 session (it carries the token detail), and one written by a staff sweep that

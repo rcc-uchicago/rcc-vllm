@@ -6,7 +6,7 @@ LLaMA-Factory, and Unsloth all produce it), a session can serve your adapter
 alongside the base model. You choose per request which one answers: requests
 that name your adapter get the fine-tuned behavior, requests that name the base
 model get the stock model. Nothing about the rest of the workflow changes —
-same commands, same URL, same key, same billing.
+same commands, same URL, same key, same token-usage report at stop.
 
 The service does not run the fine-tuning itself yet; you train elsewhere (for
 example on your own GPU allocation) and bring the resulting adapter directory.
@@ -49,7 +49,7 @@ ai-session code \
 
 The adapter set is fixed for the life of the session; to add or swap one, stop
 and start again. Every adapter is validated before anything is reserved, so a
-typo in a path fails immediately and costs nothing.
+typo in a path fails immediately, before any GPU is reserved.
 
 ## Use it
 
@@ -58,7 +58,8 @@ the base model's:
 
 - **Browser chat:** the adapter appears in the model picker next to the base
   model; select it.
-- **aider:** `aider --model openai/myft ...` (everything else as on the
+- **aider:** `aider --model openai/myft` (the flag overrides the session's base
+  model; everything else is loaded automatically, as on the
   [aider page](coding/aider.md)).
 - **A script:**
 
@@ -70,15 +71,16 @@ curl -s "$AISESSION_BASE_URL/chat/completions" \
 ```
 
 Requests that keep the base model's name (for example `qwen3.8_27B`)
-are answered by the unmodified base model, in the same session, at no extra
-cost — useful for A/B-comparing your fine-tune against stock behavior.
+are answered by the unmodified base model, in the same session, on the same
+GPUs — useful for A/B-comparing your fine-tune against stock behavior.
 
 ## Cost
 
-A session with adapters costs the same as one without: the per-hour holding
-cost of the GPUs it reserves, as described on
-[Billing and Service Units](billing.md). Serving an adapter adds a small
-per-request overhead but no additional charge.
+A session with adapters holds the same GPUs as one without, and `ai-session stop`
+reports its tokens in the same way (requests to the adapter and to the base model
+are counted together). Serving an adapter adds a small per-request overhead but
+reserves no additional GPUs. The Service Unit policy that RCC staff record is on
+[Billing and Service Units](billing.md).
 
 ## Limits
 
@@ -88,6 +90,7 @@ per-request overhead but no additional charge.
 | LoRA rank (`r`) | up to 256 |
 | Base model | must match the model the session serves |
 | Changing adapters | fixed per session; restart to change |
+| CPU sessions | not supported; `--lora` is refused with `--cpu` |
 | Path | absolute, on project/scratch storage, no spaces |
 
 If your adapter exceeds these limits (a higher rank, a full fine-tune, a

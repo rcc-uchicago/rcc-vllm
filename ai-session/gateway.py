@@ -285,6 +285,10 @@ def build_app(require_key: str = None, client=None):
         # else the peer host. Extracted before the auth branch so a keyless
         # gateway still rate-limits per client.
         sent = (request.headers.get("authorization", "") or "").removeprefix("Bearer ").strip()
+        # Anthropic-style clients (Claude Code with ANTHROPIC_API_KEY) send the key
+        # as x-api-key instead of a Bearer token.
+        if not sent:
+            sent = (request.headers.get("x-api-key", "") or "").strip()
 
         # optional auth
         if require_key and sent != require_key:
@@ -351,18 +355,25 @@ def build_app(require_key: str = None, client=None):
         # gateway. Absent (older/keyless backends) -> forward the client's header.
         backend_key = up.get("backend_key")
         if backend_key:
-            fwd_headers = {k: v for k, v in fwd_headers.items() if k.lower() != "authorization"}
+            fwd_headers = {k: v for k, v in fwd_headers.items()
+                           if k.lower() not in ("authorization", "x-api-key")}
             fwd_headers["Authorization"] = "Bearer " + backend_key
 
         # Is this a streaming generation request? If so, make sure usage is emitted.
-        is_gen = path.endswith("/chat/completions") or path.endswith("/completions")
+        # /v1/messages is the Anthropic Messages API (vLLM serves it natively; Claude
+        # Code uses it). Its usage arrives as input_tokens/output_tokens.
+        is_messages = path.endswith("/messages")
+        is_gen = (path.endswith("/chat/completions") or path.endswith("/completions")
+                  or is_messages)
         streaming = False
         model_name = None
         if is_gen and request.method == "POST" and body:
             try:
                 payload = json.loads(body)
                 model_name = payload.get("model")
-                if payload.get("stream"):
+                if payload.get("stream") and is_messages:
+                    streaming = True      # usage rides in message_start / message_delta events
+                elif payload.get("stream"):
                     streaming = True
                     opts = payload.get("stream_options") or {}
                     opts["include_usage"] = True          # so the final SSE chunk carries usage
@@ -443,7 +454,17 @@ def _scan_event_for_usage(event_bytes: bytes, captured: dict) -> None:
             obj = json.loads(data)
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and obj.get("usage"):
+        if not isinstance(obj, dict):
+            continue
+        # Anthropic stream: input_tokens arrive in message_start (inside "message"),
+        # output_tokens in message_delta -- merge them into one usage record.
+        if obj.get("type") == "message_start" and isinstance(obj.get("message"), dict):
+            u = obj["message"].get("usage") or {}
+            captured["usage"] = {**(captured["usage"] or {}), **u}
+        elif obj.get("type") == "message_delta" and obj.get("usage"):
+            nonzero = {k: v for k, v in obj["usage"].items() if v}   # don't zero message_start's input count
+            captured["usage"] = {**(captured["usage"] or {}), **nonzero}
+        elif obj.get("usage"):
             captured["usage"] = obj["usage"]          # keep the latest non-null usage
 
 
@@ -457,9 +478,12 @@ def _log_usage(path, model, usage, status, stream, backend) -> None:
         "status": status,
         "success": status < 400,
         "usage": {
-            "prompt_tokens": int(usage.get("prompt_tokens", 0)),
-            "completion_tokens": int(usage.get("completion_tokens", 0)),
-            "total_tokens": int(usage.get("total_tokens", 0)),
+            # OpenAI names, else Anthropic names (input_tokens / output_tokens).
+            "prompt_tokens": int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0),
+            "completion_tokens": int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0),
+            "total_tokens": int(usage.get("total_tokens")
+                                or (int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+                                    + int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0))),
         },
         "backend_jobid": (backend or {}).get("jobid"),
     }

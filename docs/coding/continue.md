@@ -15,10 +15,10 @@ Two things must be true before Continue can work:
   the session's port is open. The tunnel procedure and background live in the SSH
   tunnel section of [Coding Sessions](overview.md).
 
-!!! note "A running session consumes SU whether or not Continue sends requests"
-    A session bills for its wall-clock GPU reservation, idle or not (see
-    [Billing and Service Units](../billing.md)). Stop the session as described on
-    [Coding Sessions](overview.md) as soon as you stop working.
+!!! note "A running session holds its node whether or not Continue sends requests"
+    A session occupies its GPUs from start until it is stopped, idle or not. Stop
+    it with `ai-session stop` (see [Coding Sessions](overview.md)) as soon as you
+    stop working.
 
 | Step | Description | Command | Run on |
 |---|---|---|---|
@@ -36,16 +36,19 @@ this costs nothing. Run this **on the login node**:
 ai-session status
 ```
 
-A healthy session reports:
+A session that is ready reports:
 
 ```
-session: READY  (model qwen3.8_27B, URL http://localhost:<GW_PORT>/v1)
+session: READY -- open the tunnel now.
+  client settings: ai-session connect
 access key: set (abc123...; full value: ai-session connect)
 ```
 
-The port in the URL is the `<GW_PORT>` used in every later step. If the report
-says the session is still starting, wait and re-check; if it says none is
-running, start one per [Coding Sessions](overview.md).
+`ai-session connect` prints the session URL, `http://localhost:<GW_PORT>/v1`; that
+`<GW_PORT>` is used in every later step. If the report says
+`session: STARTING`, the model is still loading: wait and re-check, and do not open
+the tunnel yet. If it says none is running, start one per
+[Coding Sessions](overview.md).
 
 ## Step 2: Open the SSH tunnel (laptop editors only)
 
@@ -61,7 +64,7 @@ stays in the foreground:
 ssh -N -L <GW_PORT>:localhost:<GW_PORT> <cnetid>@<login-node>.rcc.uchicago.edu
 ```
 
-- Replace `<GW_PORT>` with the port shown by `ai-session status`.
+- Replace `<GW_PORT>` with the port in the session URL that `ai-session connect` prints.
 - Replace `<cnetid>` with your CNetID.
 - Replace `<login-node>` with the login node where the session was started. The
   tunnel command printed at start already names the correct node.
@@ -131,7 +134,9 @@ Older Continue versions read a JSON file instead:
 
 - Continue reads a static config file, so the two placeholders are filled in with
   literal values: `ai-session connect` prints this exact block with `<GW_PORT>`
-  and `<SESSION_KEY>` already substituted, ready to paste.
+  and `<SESSION_KEY>` already substituted, ready to paste. (`eval "$(ai-session env)"`
+  does not help here: Continue does not read your shell's environment.) Every new
+  session mints a new key, so update `apiKey` after each session start.
 - `allowAnonymousTelemetry: false` turns off Continue's own usage telemetry. This is
   a client-side setting independent of the model traffic, which never leaves RCC; the
   [Data location note on the home page](../index.md#data-location) explains the
@@ -162,8 +167,8 @@ session serves well.
     generation on a two-GPU coding session runs at tens of milliseconds per output
     token, which is not suitable for completion-as-you-type. If you want autocomplete,
     run a separate small-model session with `qwen3_4b` for that purpose only (see model
-    selection on [Coding Sessions](overview.md)); it reserves one A100 and bills a floor
-    of 1.0 SU per hour.
+    selection on [Coding Sessions](overview.md)); it reserves one A100 for as long as
+    it runs.
 
 ## Connection failures
 

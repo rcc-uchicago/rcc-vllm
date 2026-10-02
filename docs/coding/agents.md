@@ -3,7 +3,8 @@
 An agent is a program that drives a language model in a loop and lets it take
 actions on your behalf: read and edit files, run shell commands, fetch web
 pages, or call external tools through the Model Context Protocol (MCP). The
-autonomous clients on [opencode and Cline](opencode.md), and any custom agent
+autonomous clients on [opencode and Cline](opencode.md) and
+[Claude Code](claude-code.md), and any custom agent
 you build (see [Build your own agent](#build-your-own-agent) below), are all of
 this kind. This page is about the accountability and security consequences of
 letting a model act, not just answer. Read it before you give an agent the
@@ -75,8 +76,8 @@ out of that path.
 
 - Do not paste SSH private keys, API tokens, passwords, or the session access
   key into a prompt, a file the agent reads, or a repository the agent edits.
-- The session access key printed when a session starts authorizes billed GPU
-  time on your allocation. Treat it like a password: it lives at
+- The session access key printed when a session starts authorizes use of your
+  session, and everything sent with it is recorded under you. Treat it like a password: it lives at
   `<state-dir>/logs/gateway/session_key` (mode 600), and you share it
   deliberately, not by leaving it in a file an agent will read. See
   [Coding Sessions](overview.md#the-session-access-key).
@@ -107,6 +108,11 @@ calls the serving engine can parse. Every served model does: the coding default
 `qwen2.5_72B`, and `qwen3_4b` all work too. The launcher selects the tool-call parser that
 matches the model you serve, so there is nothing to configure. Start the session with
 `ai-session code --agent`; without that flag the session accepts no tool calls at all.
+
+On a CPU session (`ai-session code --cpu --agent`) opencode and Claude Code run with their
+tools turned off: the 0.5B CPU model cannot use tools reliably, and the tool definitions
+would make every prompt minutes long to read on a CPU node. A CPU session is for trying
+the service, not for agent work.
 
 [aider](aider.md) does not need any of this — it drives edits through the chat-completions
 API as text diffs, without native tool calling, and works against a session started either

@@ -88,20 +88,20 @@ def load_summary(summary_path: str) -> dict:
 
 
 def render_banner(summary_path: str) -> None:
-    """Print the SU banner for one summary JSON file."""
+    """Print the token-usage banner for one summary JSON file."""
     d = load_summary(summary_path)
     b = d.get("billing", {})
     s = d.get("session", {})
+    # Users see tokens consumed per job only (GPU and CPU sessions alike). The SU
+    # fields remain in the summary JSON for staff, but are not printed here.
+    tin, tout = b.get("total_input_tokens", 0), b.get("total_output_tokens", 0)
+    where = ("cpu" if b.get("gpu_tier") == "cpu"
+             else f"{b.get('n_gpus_billed', '?')} x {b.get('gpu_tier', '?')} GPU")
     print()
     print(_BAR)
-    print("  SU CHARGE -- this session")
-    print(f"    BILLED : {b.get('billed_su', 0):.4f} SU      basis={b.get('basis', '?')}")
-    print(f"    model  : {b.get('model_key', '?')} on "
-          f"{b.get('n_gpus_billed', '?')} x {b.get('gpu_tier', '?')} GPU"
-          f"   (weight {b.get('w_gpu', '?')} SU per GPU-hour)")
-    print(f"    usage  : held {b.get('reserved_wall_hours', '?')} h   "
-          f"tokens in={b.get('total_input_tokens', 0)} "
-          f"out={b.get('total_output_tokens', 0)} "
+    print("  TOKEN USAGE -- this session")
+    print(f"    model  : {b.get('model_key', '?')} ({where})")
+    print(f"    tokens : in={tin} out={tout} total={tin + tout} "
           f"({b.get('n_requests_billed', 0)} requests)")
     print(f"    session: {s.get('jobid', '?')}")
     print(f"    receipt: {summary_path}")
@@ -110,7 +110,7 @@ def render_banner(summary_path: str) -> None:
 
 def _say_none() -> None:
     print()
-    print("  SU CHARGE: none this run (no active session was billed).")
+    print("  TOKEN USAGE: none this run (no active session was ended).")
 
 
 def main(argv=None) -> int:

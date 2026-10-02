@@ -30,7 +30,7 @@ MODEL_REGISTRY = {
     "qwen3.5_122B": f"{MODELS_ROOT}/Qwen3.5-122B-A10B-FP8", # MoE, native FP8 -- serves TP=2 on 2xH200 (53069683) AND 2xH100 NVL (53538328)
     "qwen3.8_27B": f"{MODELS_ROOT}/Qwen3.8-27B",           # coding INCUMBENT -- dense 27.8B BF16, hybrid GDN+attn
     "gemma4_31B": f"{MODELS_ROOT}/Gemma-4-31B-it",          # SECOND coding option -- dense 30.7B BF16, Apache-2.0
-    "qwen2.5_0.5B": f"{MODELS_ROOT}/Qwen2.5-0.5B-Instruct", # smoke test only -- never a billing ref
+    "qwen2.5_0.5B": f"{MODELS_ROOT}/Qwen2.5-0.5B-Instruct", # tiny chat model; the ONLY model `--cpu` serves -- never a billing ref
 }
 
 # The models served to users (others are for benchmarking / smoke). ai_session.py
@@ -124,7 +124,16 @@ MODEL_REGISTRY = {
 # Serves TP=2 on all four tiers: H100 NVL, A100 80GB, A100 40GB, A40 (jobs 53544338,
 # 53544339, 53586878, 53586877). Tool calling verified with vLLM's gemma4 parser (53544725).
 # CAVEAT: no rate_table row yet -> floor billing, same as qwen3.8_27B on A100.
-PHASE1_SERVED = {"qwen2.5_72B", "qwen3_4b", "qwen3.8_27B", "gemma4_31B"}
+# qwen2.5_0.5B: served to everyone so users can try the service (browser chat,
+# opencode/aider wiring) without a GPU allocation -- `ai-session <verb> --cpu` runs it
+# on a CPU-only partition. It is the only model CPU_SERVED allows. On a GPU it has no
+# rate_table row and bills the floor, like any unrated model.
+PHASE1_SERVED = {"qwen2.5_72B", "qwen3_4b", "qwen3.8_27B", "gemma4_31B", "qwen2.5_0.5B"}
+
+# Models a CPU session (`--cpu`, DEVICE=cpu) may serve. CPU inference is only usable
+# for a model this small; anything larger would sit on a CPU node for minutes per
+# answer. Enforced in ai_session.py start AND in launch_ai_session.sh.
+CPU_SERVED = {"qwen2.5_0.5B"}
 
 KNOWN_TIERS = ("h200", "h100", "l40s", "l40", "a100", "a40", "v100", "rtx6000")
 

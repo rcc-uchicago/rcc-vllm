@@ -2,7 +2,7 @@
 
 This page collects the questions new users ask most often. If your question is about a
 specific client, the [Coding Sessions](coding/overview.md) pages and
-[Getting Started](getting-started.md) go into more depth; for charges see
+[Getting Started](getting-started.md) go into more depth; for the accounting policy see
 [Billing and Service Units](billing.md); for failures see
 [Troubleshooting](troubleshooting.md).
 
@@ -24,20 +24,24 @@ first time you start a session (`--account` and `--partition`, then remembered).
 Once you have those, you load the module and start a session as described in
 [Getting Started](getting-started.md). There is no separate signup step.
 
-### What will a session cost?
+### What will a session cost? What usage do I see?
 
-Sessions are billed in Service Units (SU), where 1 SU is one A100-GPU-hour. You are charged
-the greater of two things: the GPUs you hold (`w_gpu × N × hours`) or the tokens you
-process. For interactive work the hold cost almost always dominates. The default coding
-session (Qwen3.8-27B on two A100 cards) costs 2.0 SU per hour. The full formula and
-the measured per-model rates are in [Billing and Service Units](billing.md).
+Usage is reported to you as tokens. No estimate is printed before the job starts; when you
+run `ai-session stop`, a TOKEN USAGE box shows the model, where it ran (for example
+`2 x a100 GPU`, or `cpu`), the input, output, and total tokens, the number of requests, the
+job id, and the receipt file path. `ai-session receipt` prints the newest receipt again.
+Service Units (SU) are still computed and recorded in the receipt file and the RCC staff
+ledger, but they are not shown to users; the policy is in
+[Billing and Service Units](billing.md).
 
-### How do I keep the cost down?
+### How do I use the cluster considerately?
 
 Run `ai-session stop` the moment you stop working. An idle session still holds its GPUs
-and still bills. For interactive use the standard A100 configurations have the lowest
-hold cost, and the cheapest capable coding configuration is Gemma-4-31B on two A40 cards,
-at a 1.0 SU/hour floor.
+(or its CPU node), and no one else can use them until it ends. Prefer the smallest
+configuration that does the job: `ai-session fast` holds one GPU, and the capable coding
+configuration with the lightest footprint is Gemma-4-31B on two A40 cards. To try the
+service or test client setup, `--cpu` holds no GPU at all
+(see [Getting Started](getting-started.md#trying-the-service-without-a-gpu)).
 
 ### Is my data private?
 
@@ -63,8 +67,8 @@ login node filled in, is printed when you run `ai-session connect` and is shown 
 
 Yes. The person who starts the session receives an access key. Share that key with your
 labmates; each of them opens their own SSH tunnel to the same login node and uses the key as
-their API key. Anyone without the key is refused. All usage bills to the person who started
-the session, so coordinate within the group on who runs it.
+their API key. Anyone without the key is refused. All usage is recorded under the person who
+started the session, so coordinate within the group on who runs it.
 
 ### Which model should I use?
 
@@ -72,14 +76,15 @@ Use Qwen3.8-27B for code; Gemma-4-31B is a second coding option that is cheaper 
 faster, and the trade-off between the two is set out on
 [Coding Sessions](coding/overview.md#choosing-between-the-two-coding-models). Use the
 Qwen2.5-72B general model for mixed prose-and-code work or when you specifically want the
-largest general model, and Qwen3-4B for quick or low-cost tasks. For math and multi-step
+largest general model, and Qwen3-4B for quick or small tasks. Qwen2.5-0.5B is served only by `--cpu` sessions,
+for trying the service. For math and multi-step
 planning, the Qwen3 thinking models reason before answering — the coding default
 Qwen3.8-27B is itself a thinking model, as is the small Qwen3-4B. Both coding models accept
 images alongside text; the rest are text-only.
 
 Whichever you end up on, start small and scale up: get your prompts or agent setup working
 against the small model first — it loads faster, spends less time waiting for free GPUs, and
-costs the least per hour — then switch to a larger model without changing any client
+holds a single GPU — then switch to a larger model without changing any client
 configuration. If you need larger, ask; new models are staged on request. For a rough sense of
 how these open models compare to closed "frontier" models, see the
 [capability frame of reference](reference.md#rough-capability-frame-of-reference).
@@ -100,11 +105,13 @@ default.
 
 ### Which coding tool should I use?
 
-aider is the dependable default for editing files and needs no tool calling and no
-per-repository configuration. opencode is supported for full tool-calling agents; it needs a
-small `opencode.json` in the repository and a session started with `--agent` (see
-[opencode and Cline](coding/opencode.md)). Continue is the choice for in-editor use inside
-VS Code or JetBrains.
+aider is the dependable default for editing files: it needs no tool calling and no
+configuration — start `ai-session code` and run plain `aider` (see [aider](coding/aider.md)).
+opencode is supported for full tool-calling agents; it needs a session started with
+`--agent`, and `eval "$(ai-session env)"` in your shell before you run `opencode` — no
+`opencode.json` is needed (see [opencode and Cline](coding/opencode.md)). Claude Code runs
+against the session with `ai-session claude` (see [Claude Code](coding/claude-code.md)).
+Continue is the choice for in-editor use inside VS Code or JetBrains.
 
 ### My agent said it made a change, but nothing happened. Why?
 
@@ -133,10 +140,22 @@ capability and cost rather than on tool-calling support.
 
 ## Common problems
 
+### Can I try the service without a GPU?
+
+Yes. `ai-session chat --cpu --partition amd` (or `--partition caslake`) serves the small
+Qwen2.5 0.5B model on a CPU-only node; the CPU partition is remembered separately from your
+GPU partition. Measured on `amd`: the model is ready about 2 to 3 minutes after the job
+starts, and a short chat reply returns in seconds. Only that model is served, and `--lora`
+is refused. It is for trying the browser chat and checking that aider, opencode, or Claude
+Code is wired up, not for real coding work. See
+[Command Reference](reference.md#trying-the-service-without-a-gpu).
+
 ### My session sits in the queue and never starts.
 
 The GPUs you requested may be busy. A session waits for cards to free up, and the start
-command gives up if it waits too long. Try a smaller model (`ai-session fast`), or try
+command gives up if it waits too long. While it waits, the terminal prints
+`waiting for a compute node` with the elapsed time, and `ai-session status` reports the same
+stage. Try a smaller model (`ai-session fast`), or try
 again later.
 
 ### My connection worked and then stopped.
@@ -152,9 +171,10 @@ Browser-chat history is stored in your home directory, which has a smaller quota
 project space. Clear old conversations in the chat interface, or remove old files under
 `$HOME/.ai-session/`.
 
-### I forgot to stop my session and was billed for idle time.
+### I forgot to stop my session.
 
-An unused session bills its GPUs until its time limit expires. Always run
+An unused session holds its GPUs until its time limit expires (`--time`, default two
+hours), and its whole held time is recorded. Always run
 `ai-session stop` when you finish. If you routinely forget, ask RCC staff whether
 the idle-session reaper is enabled, which warns and then ends sessions that have gone
 quiet.

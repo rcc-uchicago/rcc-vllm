@@ -5,32 +5,34 @@ connects it to a coding tool that reads and edits source code in your git
 repository. No prompt, file content, or completion leaves the cluster. The
 command-line tools (aider, opencode) run in the terminal where your code already
 lives, over SSH, with no graphical display needed and no copy of the repository
-on your laptop. The cost is
-GPU reservation time, charged in Service Units (SU); 1 SU is 1 A100-GPU-hour (see
-[Billing and Service Units](../billing.md)).
+on your laptop. A session holds its node (GPUs, or CPU cores for a
+[CPU session](#cpu-sessions)) from start until you stop it, busy or idle. Usage is
+reported to you as the tokens the session consumed, printed when you stop it (see
+[Billing and Service Units](../billing.md) for the policy behind it).
 
 The command is `ai-session code`, the coding counterpart to the browser-chat
 `ai-session chat` on [Getting Started](../getting-started.md). The difference in
 shape: a coding tool is an interactive program you drive by hand, not a background
 server, so `ai-session code` starts the session and the gateway — the small
 always-on connection point the service runs on the login node — and then prints
-the ready-to-run client command, which you run yourself in the repository you want
-to edit. The default client is aider; [Continue](continue.md) and
-[opencode and Cline](opencode.md) connect to the same endpoint. The stack is the
+a short READY box telling you how to start a client, which you run yourself in the
+repository you want to edit. The default client is aider; [Continue](continue.md),
+[opencode and Cline](opencode.md), and [Claude Code](claude-code.md) connect to the
+same endpoint. The stack is the
 same three pieces described on [AI Sessions on RCC](../index.md): a model server
 on a GPU node, the gateway (which gives every session one stable web address in
 the standard OpenAI API format that most AI tools can talk to, and records token
-counts for billing), and your client.
+counts), and your client.
 
 ## Quick Start
 
 | Step | Description | Command | Run on |
 |---|---|---|---|
 | 0 | Put `ai-session` on your PATH (once per shell) | `module load ai-session` | Login node |
-| 1 | Start the session; wait for the READY block and the printed client command | `ai-session code` (first run: add `--account <acct> --partition <part>`) | Login node |
-| 2 | Run the printed client command inside the git repository you want to edit | printed by `ai-session code` (aider by default) | Login node or Local machine |
-| 3 | Check what is running at any time; costs nothing | `ai-session status` | Login node |
-| 4 | Stop the session, free the GPUs, print the SU charge | `ai-session stop` | Login node |
+| 1 | Start the session; wait for the READY box | `ai-session code` (first run: add `--account <acct> --partition <part>`) | Login node |
+| 2 | Check whether it is ready (from any terminal) | `ai-session status` | Login node |
+| 3 | In the git repository you want to edit, start a client | `aider`, or `eval "$(ai-session env)"` then `opencode` | Login node or Local machine |
+| 4 | Stop the session, free the node, print the tokens consumed | `ai-session stop` | Login node |
 
 ## Step 1: Start the session and gateway
 
@@ -41,52 +43,126 @@ disconnect does not take the connection point down with it:
 ai-session code
 ```
 
-The command starts the model server on cluster GPUs, waits until the model is
+The command submits the model server to a GPU node, waits until the model is
 loaded (typically several minutes for the default 27B model), starts the gateway,
-and prints a block containing the session's port, the exact aider command, and the
-SSH tunnel command for laptop access. Leave this terminal running.
+and prints a READY box. Leave this terminal running.
+
+Before the job is submitted it prints `usage is reported as the tokens this session
+consumes (shown when you stop it).` While the model loads, a banner says the
+session is not ready yet:
+
+```
+==================================================================
+  vLLM is starting -- PLEASE WAIT. The session is NOT ready yet.
+  Do not start opencode or aider (or open an SSH tunnel) until
+  you see the READY box with the connection settings. Progress
+  is shown below; from another terminal, `ai-session status`
+  shows it too.
+==================================================================
+```
+
+Progress lines with the elapsed time follow, for example
+`[1:40] compiling and warming up the model ...`. The stages, in order, are:
+waiting for a compute node; loading the model weights; compiling and warming up
+the model; starting the API server; finishing start-up. If the model server stops
+while loading, start-up ends at once with the path of the server log rather than
+waiting out the time limit.
 
 Options: `--account NAME` and `--partition NAME` name the Slurm account and GPU
 partition to run under — required on your first session and then remembered in
 `~/.ai-session/config` (see [Getting Started](../getting-started.md#step-1-start-the-session));
 `--time HH:MM:SS` sets the session time limit (default `02:00:00`; the session
-ends after this even if you forget to stop it, which caps the maximum charge);
-`--model KEY` serves a different registered model; `--agent` enables native tool
-calling, required by [opencode and Cline](opencode.md) but not by aider or
-Continue.
+ends after this even if you forget to stop it, which caps how long it can hold
+the node); `--model KEY` serves a different registered model; `--agent` enables
+native tool calling, required by [opencode and Cline](opencode.md) and by
+[Claude Code](claude-code.md) but not by aider or Continue; `--cpu` runs the
+session on a CPU-only node instead (see [CPU sessions](#cpu-sessions)).
 
-!!! warning "A running session consumes SU whether or not you send requests"
-    `ai-session code` starts a billed GPU reservation. Stop it as soon as you
+!!! warning "A running session holds its node whether or not you send requests"
+    `ai-session code` reserves GPUs until the session ends. Stop it as soon as you
     finish: `ai-session stop`
 
-Verification — the command ends with a READY banner of this form:
+### Is it ready? `ai-session status`
+
+`ai-session status` is the ready flag. Run it from any terminal on the same login
+node; it costs nothing. It prints one of:
 
 ```
-==> [2/2] starting gateway on 127.0.0.1:<GW_PORT>
-    gateway healthy (pid <PID>)  log: .../run/gateway.log
-
-================ READY -- code with the local qwen3.8_27B (ctx 32768) ================
+session: STARTING -- compiling and warming up the model (1:40 elapsed).
+  NOT ready yet: do not open the tunnel. Run `ai-session status` again in a minute.
 ```
 
-followed by the aider command to copy, the connection parameters for other
-clients, and the tunnel command. If it exits with an error instead, see
-[Troubleshooting](../troubleshooting.md).
+```
+session: READY -- open the tunnel now.
+  client settings: ai-session connect
+```
+
+```
+session: FAILED -- the model server stopped while loading.
+  log: <path to the server log>
+```
+
+Verification — the start command ends with a READY box of this form:
+
+```
+================ READY -- coding session: qwen3.8_27B ================
+
+  In your git repository on this login node (<login-node>):
+
+    eval "$(ai-session env)"     # loads the URL, access key and model
+
+  then start a client:
+
+    opencode      (first: module load opencode)
+    aider
+
+  From your laptop instead, open a tunnel first, then copy the settings
+  that `ai-session connect` prints:
+
+    ssh -N -f -L <GW_PORT>:localhost:<GW_PORT> <cnetid>@<login-node>.rcc.uchicago.edu
+
+  Access key: <key>
+  (lab members may use it too; their usage is recorded under you, <cnetid>)
+=======================================================================
+
+`ai-session connect` shows these settings again; `ai-session stop` ends the session.
+```
+
+On a session started without `--agent`, the opencode line adds
+`-- needs a session started with --agent`. If the command exits with an error
+instead, see [Troubleshooting](../troubleshooting.md).
 
 ## Step 2: Run the coding tool
 
-Open a second terminal, change into the git repository you want to edit, and run
-the command printed in Step 1. aider requires the working directory to be inside a
-git repository; run `git init` first if necessary. Per-client setup and usage:
+Open a second terminal, change into the git repository you want to edit, and
+start a client. No configuration file is needed for aider or opencode:
+
+```bash
+cd /path/to/your/repo
+aider                                   # reads the running session's settings itself
+```
+
+```bash
+module load opencode                    # opencode needs a session started with --agent
+cd /path/to/your/repo
+eval "$(ai-session env)"
+opencode
+```
+
+aider requires the working directory to be inside a git repository; run
+`git init` first if necessary. Per-client setup and usage:
 
 - [aider](aider.md) — the default; terminal REPL, edits files as text diffs.
 - [Continue (VS Code and JetBrains)](continue.md) — in-editor chat and edit/apply.
 - [opencode and Cline (Tool-Calling Agents)](opencode.md) — autonomous agents;
   require the session to be started with `ai-session code --agent`.
+- [Claude Code](claude-code.md) — `ai-session claude` runs Claude Code against
+  the session's model.
 
 Before running any autonomous agent, read
 [Agent responsibilities and risks](agents.md): an agent acts with your full
 cluster permissions, can read anything you can read (including shared project
-directories), and its actions and SU are your responsibility.
+directories), and its actions and the node time it uses are your responsibility.
 
 To run the tool on your laptop instead of the login node, first open the SSH
 tunnel (next section).
@@ -108,11 +184,13 @@ Run this **on the login node** the moment you stop working:
 ai-session stop
 ```
 
-It meters the session, releases the GPUs (stopping the clock), shuts down the
-connection point, and prints the itemized SU charge for the run as its last
-output. The same summary is written as a receipt file under your state
-directory. `ai-session stop` and
-`ai-session status` themselves cost nothing; only the running GPU session does.
+It meters the session, releases the node, shuts down the connection point,
+deletes the access key, and prints a TOKEN USAGE box as its last output: the
+model and where it ran (for example `4 x a100 GPU` or `cpu`), tokens in, out, and
+total, the number of requests, the job id, and the path of the receipt file
+written under your state directory. `ai-session receipt` prints the newest box
+again. No SU figure is printed. `ai-session stop` and `ai-session status` hold no
+node themselves; only the running session does.
 
 Verification — `ai-session status` afterwards reports no session running and no
 access key set.
@@ -126,15 +204,20 @@ them into your shell:
 eval "$(ai-session env)"
 ```
 
-This sets `AISESSION_BASE_URL`, `AISESSION_API_KEY`, and `AISESSION_MODEL` (also
-written to `~/.ai-session/env`, mode 600). `ai-session connect` prints the literal
-values and ready-to-paste setup for every client.
+This sets `AISESSION_BASE_URL`, `AISESSION_API_KEY`, `AISESSION_MODEL`, and
+`AISESSION_DEVICE` (`gpu` or `cpu`); `OPENCODE_CONFIG_CONTENT`, an inline opencode
+configuration, so opencode needs no `opencode.json`; and `OPENAI_API_BASE`,
+`OPENAI_API_KEY`, and `AIDER_*` settings for aider. The same lines are written to
+`~/.ai-session/env` (mode 600). Note that it replaces any `OPENAI_API_KEY` you had in
+that shell with the session key. Run it again after each new session start; the
+key changes every time. `ai-session connect` prints the literal values and
+ready-to-paste setup for every client.
 
 | Parameter | Value |
 |---|---|
 | Base URL | `$AISESSION_BASE_URL` — `http://localhost:<GW_PORT>/v1`; the port is derived from your numeric user ID (`8400 + UID % 90`), so it differs per user |
 | API key | `$AISESSION_API_KEY` — the session access key (see below) |
-| Model name | `qwen3.8_27B` (default), or `gemma4_31B` / `qwen2.5_72B` / `qwen3_4b`; must equal the model you started |
+| Model name | `qwen3.8_27B` (default), or `gemma4_31B` / `qwen2.5_72B` / `qwen3_4b`, or `qwen2.5_0.5B` on a CPU session; must equal the model you started |
 | Context window | 32768 tokens for coding sessions (8192 for chat sessions) |
 
 The model name is the identifier the server exposes. Clients that route through
@@ -147,14 +230,15 @@ Starting a session mints a random access key, and every request to the session
 must carry it. `ai-session code` prints it in the READY block and saves it,
 readable only by you, at `<state-dir>/logs/gateway/session_key` (mode 600);
 `ai-session connect` and `ai-session status` (first six characters only) also show
-it. Use it as the API key in every client below.
+it. `eval "$(ai-session env)"` loads it as `AISESSION_API_KEY`; aider and
+`ai-session claude` load it themselves. Use it as the API key in every client.
 
 Because the connection point binds to `127.0.0.1` and accepts only requests
 carrying the key, no one else on the shared login node can use your session by
 accident, and you can deliberately share it with your lab: give a labmate the
 key, have them open their own
 tunnel to your `GW_PORT`, and set the key as the API key in their client. All of
-their usage bills to you, the starter — one key per session, no per-person split. A
+their usage is recorded under you, the starter — one key per session, no per-person split. A
 request without the key is refused with HTTP 401. `ai-session stop` deletes the key
 file, so the key stops working when the session ends and the next start mints a
 fresh one. Only a gateway RCC staff start by hand with no key configured is
@@ -175,9 +259,11 @@ ssh -N -L <GW_PORT>:localhost:<GW_PORT> <cnetid>@<login-node>.rcc.uchicago.edu
 - Replace `<login-node>` with the login node named in the start output; the
   tunnel must target that node, not an arbitrary one.
 
-`ai-session code` prints a ready-made tunnel command with the node filled in — the
-same single-connection form, with `-f` added so the tunnel backgrounds itself once
-connected. Only if your network cannot reach the named login node directly, jump
+`ai-session code` prints a ready-made tunnel command in the READY box with the
+node filled in — the same single-connection form, with `-f` added so the tunnel
+backgrounds itself once connected. Open it only after the READY box appears
+(or `ai-session status` reports `READY`), then copy the client settings from
+`ai-session connect`. Only if your network cannot reach the named login node directly, jump
 through the round-robin alias as a fallback (this authenticates twice):
 `ssh -N -L <GW_PORT>:localhost:<GW_PORT> -J <cnetid>@midway3.rcc.uchicago.edu <cnetid>@<login-node>`.
 The client on your laptop then uses `http://localhost:<GW_PORT>/v1` as
@@ -219,8 +305,8 @@ larger of the metered token work and this floor. The canonical rate table and th
 full formula are on [Billing and Service Units](../billing.md). Advanced serving
 overrides are handled by RCC staff; ask them, or see the staff guide in the repository.
 
-!!! warning "Each of these starts a billed GPU reservation"
-    The floors above apply from the moment the session starts. Stop with
+!!! warning "Each of these reserves GPUs until you stop the session"
+    The session holds its GPUs from the moment it starts, busy or idle. Stop with
     `ai-session stop`.
 
 ### Choosing between the two coding models
@@ -288,6 +374,36 @@ multiplier, so leave it off unless a problem genuinely needs it.
     Separately: this model thinks by default at `reasoning_effort: xhigh`, which can
     generate a large number of reasoning tokens and hold the GPU longer than you expect.
     Pass `low` or `medium` for routine edits; keep `xhigh` for genuinely hard problems.
+
+## CPU sessions
+
+`--cpu` runs a session on a CPU-only node and holds no GPU. It serves one model
+only, the 0.5-billion-parameter `qwen2.5_0.5B` (Qwen2.5-0.5B-Instruct); any other
+`--model` is refused, and so is `--lora`. Give a CPU-only partition (`amd` or
+`caslake`) with `--partition` the first time; it is remembered in
+`~/.ai-session/config` separately from your GPU partition.
+
+```bash
+ai-session code --cpu --partition amd            # for aider
+ai-session code --cpu --agent --partition amd    # for opencode or Claude Code
+```
+
+Measured on `amd` (16 cores, vLLM 0.26.0 CPU build): the model is ready about 2 to
+3 minutes after the job starts. Clients connect exactly as on a GPU session.
+
+A CPU session is for trying the service and checking that a client is wired up
+correctly, not for coding work: a 0.5B model produces poor edits and cannot use
+tools reliably. For the same reason opencode and Claude Code run on a CPU session
+with their tools turned off, because the tool definitions are most of their prompt
+and a CPU node reads prompts slowly:
+
+| Client | Prompt with tools | Prompt without tools | Reply with tools | Reply without tools |
+|---|---:|---:|---:|---:|
+| opencode | 15,122 tokens | 2,006 tokens | about 2.5 min | 4 s |
+| Claude Code | 15,000–24,000 tokens | 5,859 tokens | 229 s | 32 s |
+
+A CPU session also holds its node until you stop it; stop it with `ai-session stop`,
+which prints the same TOKEN USAGE box.
 
 ## Context window and prompt sizing
 
