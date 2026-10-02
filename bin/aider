@@ -1,1 +1,32 @@
-/project/rcc/mehta5/aider-env/bin/aider
+#!/bin/bash
+# aider for ai-session: connects to YOUR running session with no setup.
+#
+# Every run refreshes ~/.ai-session/env (`ai-session env`) and loads it, so the
+# gateway URL, access key, model, edit format and context metadata always match
+# the session that is up now -- a key from an earlier session cannot linger. Flags
+# given on the command line (e.g. --model) still win: aider ranks them above env.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+AIDER_BIN=/project/rcc/mehta5/aider-env/bin/aider
+ENVFILE="$HOME/.ai-session/env"
+
+"$HERE/ai-session" env >/dev/null 2>&1 || true
+if [ -f "$ENVFILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ENVFILE"
+fi
+
+if [ -z "${AISESSION_MODEL:-}" ] || [ -z "${AISESSION_API_KEY:-}" ]; then
+  cat >&2 <<'EOF'
+No ai-session is running, so aider has no model to talk to. Start one first:
+
+  ai-session code            (GPU)
+  ai-session code --cpu      (CPU-only, small model; for trying things out)
+
+then run `aider` again. `ai-session status` shows whether it is ready.
+EOF
+  exit 1
+fi
+
+exec "$AIDER_BIN" "$@"

@@ -52,6 +52,12 @@ filesystem lets you read it, the staff-only central billing ledger. A normal use
 cannot read that ledger; the server detects this and answers from your receipts
 alone rather than failing. A session that appears in both sources is counted once.
 
+!!! note "SU here, tokens at stop"
+    `ai-session stop` and `ai-session receipt` print only the tokens a session
+    consumed. The SU figure is still computed and kept in the same per-session
+    receipt (`~/.ai-session/state/logs/usage/<user>_<jobid>_<ts>_summary.json`);
+    this server reads it from there.
+
 ## Security model
 
 These servers are deliberately narrow:
@@ -74,10 +80,12 @@ These servers are deliberately narrow:
 
 ## Enable them in opencode
 
-`ai-session mcp config` prints the block below at any time. Add it to your
-project-local `opencode.json` — the same file described on
-[opencode and Cline](opencode.md); the entries replace the placeholder
-`my-personal-server` entry shown there.
+`ai-session mcp config` prints the block below at any time. opencode itself needs
+no configuration file (`eval "$(ai-session env)"` supplies the connection; see
+[opencode and Cline](opencode.md)), so the MCP servers are the one thing you add
+by hand: put the block in an `opencode.json` in your repository root, or merge it
+into the `mcp` block of an existing one. opencode merges that file with the inline
+configuration the `eval` line loads.
 
 ```json title="opencode.json (mcp block)"
 {
@@ -96,10 +104,10 @@ project-local `opencode.json` — the same file described on
 }
 ```
 
-Start opencode from a shell in which you have run `module load ai-session`, so
-that the `ai-session` command is found. There is nothing else to configure: the
-servers locate your billing receipts automatically, including when your sessions
-use a custom state directory.
+Start opencode from a shell in which you have run `module load ai-session` (so
+that the `ai-session` command is found) and `eval "$(ai-session env)"`. There is
+nothing else to configure: the servers locate your billing receipts automatically,
+including when your sessions use a custom state directory.
 
 Other MCP-capable agents (for example Cline, or Claude Code) take the same two
 facts — command `ai-session`, arguments `mcp run jobs` (or `mcp run usage`) — in
@@ -116,7 +124,9 @@ and `gemma4_31B`, `qwen2.5_72B`, and `qwen3_4b` all work. Start the session with
 ai-session code --agent
 ```
 
-Add `--model KEY` to serve one of the others.
+Add `--model KEY` to serve one of the others. A CPU session (`--cpu`) is not
+suitable: opencode and Claude Code run there with tools turned off, so MCP tools
+are not offered to the model.
 
 ## Check a server by hand
 

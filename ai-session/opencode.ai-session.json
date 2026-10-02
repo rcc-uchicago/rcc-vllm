@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "rcc/{env:AISESSION_MODEL}",
+  "small_model": "rcc/{env:AISESSION_MODEL}",
+  "share": "disabled",
+  "autoupdate": false,
+  "enabled_providers": ["rcc"],
+  "provider": {
+    "rcc": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "RCC ai-session",
+      "options": {
+        "baseURL": "{env:AISESSION_BASE_URL}",
+        "apiKey": "{env:AISESSION_API_KEY}"
+      },
+      "models": {
+        "{env:AISESSION_MODEL}": {
+          "name": "{env:AISESSION_MODEL}",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}

@@ -5,10 +5,10 @@ in how they drive the model: instead of asking for edits as plain text, they use
 native function calling (tool calling), where the model returns a
 structured call — a function name plus JSON arguments — that the agent then executes
 (read a file, apply an edit, run a command (grep), run a tool (squeue)). opencode is a
-supported client; it needs the provider configuration (`opencode.json`) described in Step 2,
-and occasionally a retry. aider remains the default and recommended client: it performs the
-same edits through the chat-completions API without function calling and needs no
-per-repository configuration at all.
+supported client; it needs no configuration file — one `eval` line loads the session's
+settings (Step 2) — and occasionally a retry. aider remains the default and recommended
+client: it performs the same edits through the chat-completions API without function
+calling.
 
 Because these agents need function calling, the session must be started with tool
 calling enabled (`ai-session code --agent`); a session started for aider or
@@ -20,10 +20,11 @@ calling enabled (`ai-session code --agent`); a session started for aider or
 
 | Step | Description | Command | Run on |
 |---|---|---|---|
-| 1 | Start a session with tool calling enabled | `ai-session code --agent` | Login node |
-| 2 | Get opencode, then create `opencode.json` in your repository (Step 2 below) | `module load opencode` (login node) or `curl -fsSL https://opencode.ai/install \| bash` (laptop) | Wherever opencode runs |
-| 3 | Run opencode inside your git repository | `opencode` | Laptop or login node |
-| 4 | Stop the session when finished | `ai-session stop` | Login node |
+| 1 | Start a session with tool calling enabled; wait for the READY box | `ai-session code --agent` | Login node |
+| 2 | Put opencode on your PATH | `module load opencode` | Login node |
+| 3 | Load the session's settings into the shell | `eval "$(ai-session env)"` | Login node |
+| 4 | Run opencode inside your git repository | `opencode` | Login node |
+| 5 | Stop the session when finished | `ai-session stop` | Login node |
 
 ## Step 1: Start the session with tool calling enabled
 
@@ -34,124 +35,97 @@ not terminate the gateway:
 ai-session code --agent
 ```
 
-!!! warning "A running session consumes SU whether or not you send requests"
-    The reservation floor for the default configuration (Qwen3.8-27B, 2 A100
-    GPUs) is 2.0 SU per hour; see [Billing](../billing.md). Stop with
-    `ai-session stop` as soon as you finish.
+!!! warning "A running session holds its node whether or not you send requests"
+    The session occupies its GPUs (2 A100 for the default Qwen3.8-27B) until you
+    stop it, busy or idle. Stop with `ai-session stop` as soon as you finish.
 
 `--agent` starts the model server with tool calling enabled, selecting the tool-call
 parser that matches the model you are serving. This switch controls only tool calling; the
 served context length is independent of it and stays at the coding default of 32768 tokens.
 
-The command blocks until the model is loaded (typically several minutes for the
-27B model) and then prints a block containing the session's port (`GW_PORT`), the
-connection parameters, and the SSH tunnel command. Note the port; you need it in
-Step 2. Verify at any time (no cost):
+The command shows start-up progress and blocks until the model is loaded
+(typically several minutes for the 27B model), then prints the READY box. Do not
+start opencode before the READY box appears. From another terminal, check at any
+time:
 
 ```bash
 ai-session status
 ```
 
-## Step 2: Configure opencode
+It reports `session: STARTING -- <stage>` while loading and `session: READY` once
+clients can connect.
+
+## Step 2: Run opencode
 
 On the cluster, opencode is a central module, the same as `ai-session` itself:
 `module load opencode` works from any login node with no `module use` line and no
-special group membership. **On the login node:**
+special group membership. **On the login node**, in your git repository:
 
 ```bash
 module load opencode
-opencode --version   # the service currently provides 1.14.41, the verified version
-```
-
-If opencode runs on your laptop instead, install it there with the official
-script, `curl -fsSL https://opencode.ai/install | bash` (or
-`npm install -g opencode-ai`), and open the SSH tunnel printed at start first so
-`localhost:<GW_PORT>` reaches the session (see
-[Coding Sessions](overview.md)); on a login node no tunnel is needed.
-
-One file must be placed in the repository you are editing: `opencode.json` (the
-provider configuration). A project-local `opencode.json` is merged over your personal
-`~/.config/opencode/opencode.json`, so nothing personal is modified.
-
-### opencode.json
-
-The verified example file ships with the service. If your repository is on the
-cluster, copy it (**on the login node**, after `module load ai-session`), and
-load the endpoint and key into your shell — the file references them as
-environment variables, so there is nothing to edit for the connection:
-
-```bash
 cd /path/to/your/repo
-cp "$AISESSION_HOME/ai-session/opencode.example.json" ./opencode.json
 eval "$(ai-session env)"
+opencode
 ```
 
-If your repository is on your laptop, create `opencode.json` in the repository
-root with exactly the following content, which reproduces the example file:
+`eval "$(ai-session env)"` exports the session URL, access key, and model name, and
+`OPENCODE_CONFIG_CONTENT`, an inline opencode configuration built from those values.
+No `opencode.json` is needed, nothing in your repository or your personal
+`~/.config/opencode/` is modified, and the same line works unchanged for every
+session, port, and key. Run the `eval` line again after starting a new session: the
+access key changes with every session. The line also sets `OPENAI_API_KEY` in that
+shell to the session key, replacing any value you had there.
 
-```json title="opencode.json"
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "rcc/qwen3.8_27B",
-  "small_model": "rcc/qwen3.8_27B",
-  "share": "disabled",
-  "autoupdate": false,
-  "enabled_providers": ["rcc"],
-  "mcp": {
-    "my-personal-server": {
-      "type": "local",
-      "enabled": false,
-      "command": ["true"]
-    }
-  },
-  "provider": {
-    "rcc": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "RCC local vLLM",
-      "options": {
-        "baseURL": "{env:AISESSION_BASE_URL}",
-        "apiKey": "{env:AISESSION_API_KEY}"
-      },
-      "models": {
-        "qwen3.8_27B": {
-          "name": "Qwen3.8-27B (local)",
-          "limit": {
-            "context": 32768,
-            "output": 8192
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-- The `{env:...}` references resolve from opencode's environment. On the login
-  node, `eval "$(ai-session env)"` sets both variables. On your laptop, export
-  them yourself with the values `ai-session connect` prints (the base URL is the
-  same `http://localhost:<GW_PORT>/v1` once the tunnel is open):
-  `export AISESSION_BASE_URL=... AISESSION_API_KEY=...`. The key is required;
-  a request without it is refused with HTTP 401. See
-  [Coding Sessions](overview.md#the-session-access-key) for sharing it with your lab.
-- The `mcp` block is the only part of the file a user ever edits. Replace
-  `my-personal-server` with the name of each MCP server in your personal
-  `~/.config/opencode/opencode.json`, one disabled entry per server; delete the
-  `mcp` block if you have none. The connection is never configured by editing
-  the file: the URL and key always arrive through the two environment
-  variables, so the same file works unchanged for every session, port, and key.
-
-What the entries do: the `rcc` provider block routes requests through the generic
+What the inline configuration does: it routes requests through the generic
 OpenAI-compatible adapter (`@ai-sdk/openai-compatible`) to the session URL with the
-session access key; `model` and `small_model` both point at the local model, so no
-request leaves the cluster (opencode's default `small_model`, used for session
+session access key; `model` and `small_model` both point at the session's model, so
+no request leaves the cluster (opencode's default `small_model`, used for session
 titles, is an externally hosted model); `enabled_providers` makes the local provider
 the only selectable one; `share` is disabled and `autoupdate` is off, so the tool
-does not contact opencode's external services while you work; the `limit` block
+does not contact opencode's external services while you work; a `limit` block
 declares the served 32768-token context and an 8192-token output cap so opencode
-sizes its prompts correctly.
+sizes its prompts correctly. opencode shows the model under its served name, for
+example `qwen3.8_27B`.
 
-The `mcp` block matters more than it looks: MCP servers from your personal
-configuration are advertised to the model as extra tools and inflate every prompt.
+The inline configuration takes precedence over a repository's own `opencode.json`,
+so a project file that pins some other model does not redirect your requests.
+
+Verification, before spending tokens:
+
+```bash
+opencode models   # lists one model: rcc/<the model your session serves>
+```
+
+!!! note "A per-repository file is still possible"
+    `$AISESSION_HOME/ai-session/opencode.example.json` still ships with the service
+    for anyone who prefers an `opencode.json` checked into a repository. It reads the
+    URL and key from the same environment variables, so you still run
+    `eval "$(ai-session env)"` first; its model name is fixed to `qwen3.8_27B` and
+    must be edited if you serve another model.
+
+!!! note "Personal MCP servers inflate every prompt"
+    MCP servers declared in your personal `~/.config/opencode/opencode.json` are
+    advertised to the model as extra tools on every request. If you have any, disable
+    them for ai-session work (set `"enabled": false` on each entry).
+
+### opencode on your laptop
+
+Install opencode there with the official script,
+`curl -fsSL https://opencode.ai/install | bash` (or `npm install -g opencode-ai`).
+Open the SSH tunnel printed in the READY box so `localhost:<GW_PORT>` reaches the
+session (see [Coding Sessions](overview.md#remote-access-from-your-laptop)), then
+copy the settings that `ai-session connect` prints. On the cluster this step is
+unnecessary: the module provides opencode and no tunnel is needed.
+
+### opencode on a CPU session
+
+On a CPU session (`ai-session code --cpu --agent`), `eval "$(ai-session env)"`
+loads a variant of the inline configuration with opencode's tools turned off. The
+tool definitions are most of opencode's prompt, and a CPU node reads prompts
+slowly: measured, the prompt drops from 15,122 to 2,006 tokens and a reply from
+about 2.5 minutes to 4 seconds. The 0.5B CPU model cannot use tools reliably
+anyway. On a CPU session opencode can therefore answer questions but cannot read
+or edit files; use it to try the service and check your setup, not for coding work.
 
 ### If you have an `AGENTS.md` workaround file, delete it
 
@@ -177,14 +151,6 @@ instructions; it is only the tool-call workaround that must go.
 
 ### Run
 
-Sanity-check the configuration before spending tokens, then run opencode inside
-your git repository:
-
-```bash
-opencode models   # must list exactly one model: rcc/qwen3.8_27B
-opencode
-```
-
 If opencode occasionally prints tool-call JSON as ordinary chat text instead of acting on
 it, re-issue the instruction. If it happens on every turn, check that the session was
 started with `--agent` and that you have no leftover `AGENTS.md` workaround file; switch to
@@ -201,8 +167,8 @@ To use it, start a thinking session and point opencode at that model:
 
 ```bash
 ai-session code --model qwen3_4b --agent           # serve a thinking model
-# in opencode.json set "model": "rcc/qwen3_4b" and add it under the provider's models
-opencode run --thinking --model rcc/qwen3_4b "…"   # prints a "Thinking: …" block, then the answer
+eval "$(ai-session env)"                           # opencode now uses rcc/qwen3_4b
+opencode run --thinking "…"                        # prints a "Thinking: …" block, then the answer
 ```
 
 The interactive TUI shows the thinking block inline above each reply. `qwen3_4b` and the
@@ -223,13 +189,13 @@ but nothing has been verified either. aider is the fallback.
 ## Step 3: Stop the session
 
 !!! warning "Stop the session as soon as you stop working"
-    A session is billed at least its reservation floor — GPU-type weight times GPU
-    count times hours held — regardless of request volume. Run `ai-session stop`
-    immediately when you finish:
+    A session holds its node until it is stopped, regardless of request volume.
+    Run `ai-session stop` immediately when you finish:
 
 ```bash
 ai-session stop
 ```
 
-This meters the session, releases the GPUs, stops the gateway, and prints the SU
-charge for the run.
+This releases the GPUs, stops the gateway, deletes the access key, and prints a
+TOKEN USAGE box: the model, where it ran, tokens in, out, and total, the number of
+requests, the job id, and the receipt file path.

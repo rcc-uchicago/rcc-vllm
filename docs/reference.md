@@ -8,9 +8,9 @@ place: the `ai-session` command and its arguments. The specific paths are covere
 All commands on this page run **on the login node**. A session serves one model
 on cluster GPUs; the gateway — the small always-on relay the service runs on the
 login node at a fixed per-user port — forwards requests to wherever the current
-session is running, so clients keep one stable address. Charges are counted in
-Service Units (SU), where 1 SU = 1 A100-GPU-hour; the formula and rates are on
-[Billing and Service Units](billing.md).
+session is running, so clients keep one stable address. When a session ends,
+`ai-session stop` reports the tokens it consumed; how RCC staff account for
+sessions is on [Billing and Service Units](billing.md).
 
 ## Setup
 
@@ -25,19 +25,21 @@ install.
 
 ## Command summary
 
-| Task | Command | Cost |
+| Task | Command | Holds |
 |---|---|---|
-| Start a general chat session (browser UI) | `ai-session chat` | 4.0 SU/h floor |
-| Start a coding session (aider/Continue/opencode) | `ai-session code` | 2.0 SU/h floor |
-| Start a small, cheap chat session | `ai-session fast` | 1.0 SU/h floor |
-| Is the session ready, loading, or stopped? | `ai-session status` | free |
-| Print client setup (URL, key, per-client commands) | `ai-session connect` | free |
-| Export `AISESSION_*` variables for clients | `eval "$(ai-session env)"` | free |
-| List the model presets | `ai-session models` | free |
-| Re-print the newest billing receipt | `ai-session receipt` | free |
-| Print the agent tool-server (MCP) config block | `ai-session mcp config` | free |
-| Run a built-in tool server (agents call this) | `ai-session mcp run jobs` / `ai-session mcp run usage` | free |
-| Stop the session, free the GPUs, print the charge | `ai-session stop` | free (ends the billing) |
+| Start a general chat session (browser UI) | `ai-session chat` | 4 GPUs (`qwen2.5_72B`) until stopped |
+| Start a coding session (aider/Continue/opencode/Claude Code) | `ai-session code` | 2 GPUs (`qwen3.8_27B`) until stopped |
+| Start a small chat session | `ai-session fast` | 1 GPU (`qwen3_4b`) until stopped |
+| Any of the three on a CPU node | add `--cpu` | one CPU node (`qwen2.5_0.5B`) until stopped |
+| Is the session ready, loading, or stopped? | `ai-session status` | nothing |
+| Print client setup (URL, key, per-client commands) | `ai-session connect` | nothing |
+| Export the client settings into this shell | `eval "$(ai-session env)"` | nothing |
+| Run Claude Code against the session's model | `ai-session claude` | nothing |
+| List the model presets | `ai-session models` | nothing |
+| Re-print the newest token-usage receipt | `ai-session receipt` | nothing |
+| Print the agent tool-server (MCP) config block | `ai-session mcp config` | nothing |
+| Run a built-in tool server (agents call this) | `ai-session mcp run jobs` / `ai-session mcp run usage` | nothing |
+| Stop the session, free the node, print the tokens consumed | `ai-session stop` | releases the node |
 
 The accepted arguments:
 
@@ -45,14 +47,56 @@ The accepted arguments:
 |---|---|---|
 | `--account NAME` | none — required once | Your Slurm account. Required on the first session, then remembered in `~/.ai-session/config`; there is no default because the account is unique per user/PI. |
 | `--partition NAME` | none — required once | The GPU partition to run in. Required on the first session, then remembered. |
-| `--time HH:MM:SS` | `02:00:00` | Session time limit. The session ends when it expires even if you forget `stop`, capping the maximum floor charge. |
+| `--time HH:MM:SS` | `02:00:00` | Session time limit. The session ends when it expires even if you forget `stop`, which caps how long a forgotten session holds its node. |
 | `--model KEY` | the preset's model | Serve a different registered model (table below); the GPU configuration is chosen for you. |
 | `--agent` | off | Enable native tool calling: required by [opencode and Cline](coding/opencode.md) (not by aider or Continue), and used on `chat` for the model to call the opt-in [reference tools](getting-started.md#web-search-and-reference-tools-opt-in) itself. |
 | `--lora NAME=PATH` | none | Also serve your own fine-tuned adapter under the name `NAME`; repeatable. Validated before anything is reserved. See [Your Own Fine-Tuned Model](lora.md). |
+| `--cpu` | off | Run on a CPU-only partition instead of a GPU. Serves `qwen2.5_0.5B` only (any other `--model` is refused), and reserves no GPU; `ai-session stop` reports the tokens the job consumed (input, output, requests). Give a CPU partition with `--partition` (`amd` or `caslake`); it is remembered separately from your GPU partition. Not combinable with `--lora`. See [Trying the service without a GPU](#trying-the-service-without-a-gpu). |
 
-!!! warning "A running session consumes SU whether or not you send requests"
-    Every start verb reserves GPUs billed at least the reservation floor until you
-    run `ai-session stop`. The floor rate is printed before the session starts.
+!!! warning "A running session holds its node whether or not you send requests"
+    Every start verb reserves its GPUs (or, with `--cpu`, its CPU node) and holds
+    them, busy or idle, until you run `ai-session stop` or `--time` expires; no one
+    else can use them meanwhile. `ai-session stop` frees the node and prints the
+    tokens the session consumed.
+
+## Start-up progress and `ai-session status`
+
+A start verb waits on the login node until the session is usable, which takes a
+few minutes. While it waits it prints a banner -- for `chat` and `fast`:
+
+```text
+vLLM is starting -- PLEASE WAIT. The web page is NOT ready yet. Do not open the SSH
+tunnel or the browser until you see the READY box with the tunnel command.
+```
+
+and for `code` the same banner says the session is not ready and not to start
+opencode or aider (or open an SSH tunnel) until the READY box with the connection
+settings appears. Below it, one progress line per stage with the elapsed time, for
+example `[1:40] compiling and warming up the model ...`. The stages, in order:
+
+1. waiting for a compute node
+2. loading the model weights
+3. compiling and warming up the model
+4. starting the API server
+5. finishing start-up
+
+For `chat`, once the model is loaded the terminal adds "The model is loaded, but the
+web page is still NOT ready -- please wait for the READY box." while the browser UI
+starts. If the model server exits while loading, start-up stops at once and prints
+the path to its log, rather than waiting out the time-out.
+
+`ai-session status` is the ready flag, and works from any shell on the same login
+node. It prints one of three states:
+
+| Output | Meaning |
+|---|---|
+| `session: STARTING -- <stage> (m:ss elapsed).` followed by `NOT ready yet: do not open the tunnel.` | Still starting; run `ai-session status` again in a minute. |
+| `session: READY -- open the tunnel now.` | Usable. For `chat` it also prints the exact `ssh -N -f -L ...` command and the browser URL; for `code` it points to `ai-session connect` for the client settings. |
+| `session: FAILED -- <reason>.` followed by `log: <path>` | Start-up failed; the log path is the model server's log. See [Troubleshooting](troubleshooting.md). |
+
+When no start-up is in progress it reports the gateway's view instead (for example
+`session: none running`), the first six characters of the access key, and your
+session jobs in the queue.
 
 ## Where session state lives
 
@@ -63,15 +107,69 @@ directory.
 - `AISESSION_STATE_DIR` is the per-user writable root — `~/.ai-session/state`
   under your own home directory by default, so a session needs no write access to
   the shared install. It holds session records, the gateway pointer, per-request
-  usage capture, billing receipts, and server logs. Set it to a scratch path if
+  usage capture, token-usage receipts, and server logs. Set it to a scratch path if
   your home quota is tight.
 - `~/.ai-session/env` (mode 600) holds the current session's client settings —
   written by the start verbs and refreshed by `ai-session env` and
-  `ai-session connect`.
+  `ai-session connect`. Its contents are the variables listed under
+  [Client settings](#client-settings-ai-session-env).
+- Token-usage receipts are written as
+  `~/.ai-session/state/logs/usage/<user>_<jobid>_<timestamp>_summary.json`
+  (under `AISESSION_STATE_DIR` if you moved it).
 - Default ports are derived from your numeric user ID so two users on one login
   node do not collide: the gateway listens on `GW_PORT = 8400 + UID % 90` and the
   browser UI on `3000 + UID % 90`. Print yours with
   `echo $((8400 + $(id -u) % 90)) $((3000 + $(id -u) % 90))`.
+
+## Trying the service without a GPU
+
+`--cpu` starts the same session -- gateway, access key, browser chat, and the
+client settings from `ai-session connect` -- on a CPU-only node, serving the small
+Qwen2.5 0.5B Instruct model. It holds no GPU, so it is the way to try the browser
+chat or to check that opencode, aider or Claude Code are wired up before starting a
+GPU session. When you stop it, `ai-session stop` reports the tokens the job
+consumed -- input, output and the number of requests -- as it does for a GPU
+session.
+
+The partition must be a CPU-only one, `amd` or `caslake`. Give it with
+`--partition` the first time; it is remembered as `CPU_PARTITION` in
+`~/.ai-session/config`, separately from your GPU partition. Any `--model` other
+than `qwen2.5_0.5B` is refused, and so is `--lora`.
+
+1. Start a browser chat on the `amd` partition (the first time, also give `--account`):
+
+        ai-session chat --cpu --account <acct> --partition amd
+
+2. Or start a coding session (`--agent` is needed for opencode and Claude Code), then
+   in the same shell load the settings and run a client:
+
+        ai-session code --cpu --agent --partition amd
+        eval "$(ai-session env)"
+        opencode            # first: module load opencode
+        aider
+        ai-session claude
+
+3. Stop it as usual with `ai-session stop`.
+
+!!! note "On a CPU session, opencode and Claude Code run without tools"
+    Their tool definitions are most of their prompt, and reading a long prompt
+    takes minutes on CPU. On a `--cpu` session `ai-session env` gives opencode a
+    configuration with tools turned off, and `ai-session claude` starts Claude Code
+    with tools turned off. The 0.5B model cannot use tools reliably in any case.
+
+Measured on `amd` (16 cores, vLLM 0.26.0 CPU build, 2026-10-01):
+
+| Client | Prompt per request | Reply time |
+|---|---:|---:|
+| Browser chat, short question | short | seconds |
+| opencode, tools on | 15,122 tokens | about 2.5 min |
+| opencode, tools off (what `--cpu` uses) | 2,006 tokens | 4 s |
+| Claude Code, tools on | 15,000-24,000 tokens | 229 s |
+| Claude Code, tools off (what `--cpu` uses) | 5,859 tokens | 32 s |
+
+The model is ready about 2-3 minutes after the job starts. The 0.5B model answers
+simple prompts but does no useful coding work, so treat `--cpu` as a way to try the
+service and check client wiring, not as a working coding assistant.
 
 ## Models
 
@@ -84,7 +182,7 @@ directory.
 | `gemma4_31B` | Gemma-4-31B-it | Yes (`code --model gemma4_31B`); second coding option; thinking OFF by default, opt-in; accepts images; A40 or A100, TP=2 | Apache-2.0 |
 | `qwen3_4b` | Qwen3-4B | Yes (`fast` preset; also `code --model qwen3_4b` for cheap coding) | Apache-2.0 |
 | `qwen3.5_122B` | Qwen3.5-122B-A10B (FP8) | **Requires H100 or H200** (FP8 will not run on Ampere) — see [Which GPUs each model needs](#which-gpus-each-model-needs). Validated at TP=2 on both Hopper tiers; awaiting a billing rate before it joins the served set | Apache-2.0 |
-| `qwen2.5_0.5B` | Qwen2.5-0.5B-Instruct | RCC staff only (smoke tests) | Apache-2.0 |
+| `qwen2.5_0.5B` | Qwen2.5-0.5B-Instruct | Yes; the only model `--cpu` serves. Answers are basic -- use it to try the service and wire up clients, not for real work | Apache-2.0 |
 
 The license terms and the obligations that apply when you serve these models to
 other people are set out on [Model licenses](licenses.md). Every model offered is
@@ -210,8 +308,81 @@ request and refuses requests without it (HTTP 401). The start verbs print it in
 the READY block and save it readable only by you; `ai-session connect` re-prints
 it, `ai-session env` exports it as `AISESSION_API_KEY`, and `ai-session status`
 shows its first six characters. Share it with your lab to let them use your
-session over their own tunnel — all of their usage bills to you, the starter.
+session over their own tunnel — their tokens are counted in your session's usage.
 `ai-session stop` deletes the key, and the next start mints a fresh one.
+
+## Client settings (`ai-session env`)
+
+`eval "$(ai-session env)"` loads the running session's settings into the current
+shell. After it, opencode and aider need no configuration file and no flags. It
+exports:
+
+| Variable | Value | Used by |
+|---|---|---|
+| `AISESSION_BASE_URL` | `http://localhost:<GW_PORT>/v1` | scripts, curl, Python |
+| `AISESSION_API_KEY` | the session access key | scripts, curl, Python |
+| `AISESSION_MODEL` | the served model key, e.g. `qwen3.8_27B` | scripts, curl, Python |
+| `AISESSION_DEVICE` | `gpu` or `cpu` | `ai-session claude` (tools off on `cpu`) |
+| `OPENCODE_CONFIG_CONTENT` | an inline opencode configuration that points at the session (tools off on a `--cpu` session) | opencode |
+| `OPENAI_API_BASE`, `OPENAI_API_KEY` | the session URL and access key | aider |
+| `AIDER_MODEL`, `AIDER_WEAK_MODEL` | `openai/<model>` | aider |
+| `AIDER_MODEL_METADATA_FILE` | the shared model-metadata file | aider |
+| `AIDER_EDIT_FORMAT` | `diff` | aider |
+| `AIDER_ANALYTICS_DISABLE` | `true` | aider |
+
+Three consequences worth knowing:
+
+1. `OPENAI_API_KEY` is overwritten in that shell. If you also use the OpenAI API
+   from the same shell, open a new one or re-export your own key afterwards.
+2. `OPENCODE_CONFIG_CONTENT` takes precedence over an `opencode.json` in your
+   repository, so a repository file that pins another model does not redirect
+   opencode away from the session. opencode shows the model under its real name
+   (e.g. `qwen2.5_0.5B`). opencode needs a session started with `--agent`.
+3. aider does not need the `eval` at all: the `aider` that `module load ai-session`
+   provides reads the running session's settings itself each time it starts, and
+   if no session is running it says so. Flags on its command line still win (for
+   example `--edit-format whole`).
+
+On your laptop, open the tunnel printed in the READY box, then copy the settings
+that `ai-session connect` prints.
+
+## Claude Code (`ai-session claude`)
+
+`ai-session claude` runs Claude Code against the running session's model. The
+model server answers the Anthropic Messages API (`/v1/messages`) and the gateway
+forwards it with the same access key, so token usage is recorded like any other
+request.
+
+1. Start a coding session with tool calling (on a GPU for real work):
+
+        ai-session code --agent
+
+2. When it is READY, run Claude Code against it:
+
+        ai-session claude
+
+    Extra arguments are passed to Claude Code, for example
+    `ai-session claude -p "Explain this repository's build"`.
+
+The settings apply to that one run only. `ai-session claude` points Claude Code at
+the gateway with the session key and model, caps each reply at 4,096 output tokens,
+turns off non-essential network traffic, shows the model as
+`<model> (ai-session)` in `/model` and the status line, and uses its own
+configuration directory, `~/.ai-session/claude`. Your normal Claude Code login,
+history, plugins and hooks are not touched, and a later plain `claude` talks to
+Anthropic as usual. The first interactive run shows Claude Code's one-time setup
+screens.
+
+It requires Claude Code to be installed (`claude` on your PATH); if it is not,
+`ai-session claude` prints the install command:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+On a GPU session Claude Code has its tools. On a `--cpu` session it runs without
+tools (see [Trying the service without a GPU](#trying-the-service-without-a-gpu)),
+which is enough to check the connection but not to do coding work.
 
 ## Scripted access with curl and Python
 
@@ -262,8 +433,8 @@ print(resp.usage)
 The gateway records per-request token usage automatically: every chat/completions
 response's `usage` object is appended to a per-day usage log under your state
 directory, and for streaming requests the gateway asks the engine to report usage
-in the final stream chunk. `ai-session stop` consumes this log as the billing
-source, so scripted clients need no billing instrumentation. Server-side tool
+in the final stream chunk. `ai-session stop` totals this log for the token-usage
+receipt, so scripted clients need no usage instrumentation of their own. Server-side tool
 calling for agent frameworks requires a session started with
 `ai-session code --agent`; see the [coding agents guide](coding/opencode.md).
 
@@ -279,12 +450,25 @@ calling for agent frameworks requires a session started with
     When no session is active, proxied requests return 503 with
     `"type": "no_backend"`; see [Troubleshooting](troubleshooting.md).
 
-## Checking a charge
+## Checking token usage
 
-`ai-session stop` prints the itemized charge; `ai-session receipt` re-prints the
-newest receipt, and `ai-session receipt <file>` renders an older one. How the
-bill is computed — token sources, the floor, cross-checks, and the fallbacks for
-unrated configurations — is on [Billing and Service Units](billing.md).
+`ai-session stop` ends the session and prints its token usage as its last output:
+
+```text
+==============================================================
+  TOKEN USAGE -- this session
+    model  : <model_key> (<n> x <gpu type> GPU | cpu)
+    tokens : in=<T_in> out=<T_out> total=<T_in + T_out> (<n> requests)
+    session: <job id>
+    receipt: <path to the summary JSON>
+==============================================================
+```
+
+`ai-session receipt` re-prints the newest receipt, and `ai-session receipt <file>`
+renders an older one. The receipt file is the per-session summary JSON,
+`~/.ai-session/state/logs/usage/<user>_<jobid>_<timestamp>_summary.json`. No SU
+figure is printed; the SU accounting RCC staff keep is described on
+[Billing and Service Units](billing.md).
 
 ## For administrators
 

@@ -22,7 +22,7 @@
 #   * A100(80GB) TP=2  (default here) -- code-tuned, HALF the GPUs of the 72B, cheaper.
 #   * Override to the general 72B for non-coding/mixed work, or H200 for throughput:
 #         MODEL=qwen2.5_72B   TP=4 CONSTRAINT=A100 bash .../run_coding_agent.sh up
-#         MODEL=qwen2.5_coder_32B TP=2 CONSTRAINT=H200 bash .../run_coding_agent.sh up
+#         MODEL=qwen3.8_27B TP=2 CONSTRAINT=H100 bash .../run_coding_agent.sh up
 # Coding sessions serve at a WIDE 32K context (MAX_MODEL_LEN, vs the 8192 chat default)
 # so aider can actually read repo files -- Qwen2.5 supports 32K natively (no YaRN).
 # Still NO --agent-client: aider uses text-edit diffs, not native tool-calls (vLLM
@@ -60,7 +60,7 @@ USAGE_DIR="$AISESSION_STATE_DIR/logs/usage"      # `end` drops <user>_<jobid>_<t
 KEYFILE="$AISESSION_STATE_DIR/logs/gateway/session_key"  # per-session gateway access key (mode 600)
 
 # Coding wants the code-specialized model. Override via env.
-MODEL=${MODEL:-qwen2.5_coder_32B}
+MODEL=${MODEL:-qwen3.8_27B}
 TP=${TP:-2}
 CONSTRAINT=${CONSTRAINT:-A100}         # uppercase A100 = 80GB nodes (32B@TP2 fits; 40GB 'a100' won't)
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}  # WIDE context for coding (chat default is 8192); Qwen2.5 native 32K
@@ -84,6 +84,14 @@ READY_TIMEOUT=${READY_TIMEOUT:-900}
 ACTION=${1:-up}
 
 # --- helpers ---------------------------------------------------------------- #
+# Bring-up progress for `ai-session status` (same file ai_session.py writes while
+# the model loads). state: queued | loading | model_ready | ready | failed.
+PROGRESS_FILE="$RUN_DIR/progress.json"
+write_progress() {   # state  message  [extra-json-fields]
+  printf '{"state": "%s", "message": "%s", "updated": %s%s}\n' \
+    "$1" "$2" "$(date +%s)" "${3:+, $3}" > "$PROGRESS_FILE.tmp" && mv "$PROGRESS_FILE.tmp" "$PROGRESS_FILE"
+}
+
 port_busy() { ss -ltn 2>/dev/null | grep -q ":$1 "; }       # is anything listening on :$1 ?
 
 wait_gateway() {   # timeout_s -- poll the gateway's own health endpoint (200 == ready)
@@ -146,13 +154,13 @@ do_up() {
     echo "ERROR: model '$MODEL' is not fully staged at: ${MODEL_DIR:-<unknown>}" >&2
     echo "       (missing config.json/*.safetensors, or a download is still in flight)." >&2
     echo "       Wait for staging to finish, or pick a staged model, e.g.:" >&2
-    echo "           MODEL=qwen2.5_72B TP=4 bash $HERE/run_coding_agent.sh up" >&2
+    echo "           ai-session code --model qwen3.8_27B" >&2
     exit 1
   fi
   if port_busy "$GW_PORT"; then
     echo "Something is already listening on :$GW_PORT (maybe a browser demo or another user)." >&2
-    echo "Either '$HERE/run_coding_agent.sh down', or pick a free port:" >&2
-    echo "    GW_PORT=8490 bash $HERE/run_coding_agent.sh up" >&2
+    echo "Either stop your running session with 'ai-session stop', or pick a free port:" >&2
+    echo "    GW_PORT=8490 ai-session code" >&2
     exit 1
   fi
 
@@ -164,15 +172,18 @@ do_up() {
   # session); the walltime is $TIME (exported as TIME_LIMIT), the same value
   # ai_session.py bills against. A whole-node reservation can bill a larger N;
   # token work only adds above the floor.
-  echo "==> pre-flight: $($PY "$HERE/preflight_estimate.py" --constraint "$CONSTRAINT" --n "$TP" --time "$TIME")"
+  # AISESSION_CPU=1 (`ai-session <verb> --cpu`): CPU-only session, no GPU reserved.
+  CPU_FLAG=""
+  [ "${AISESSION_CPU:-0}" = "1" ] && CPU_FLAG="--cpu"
+  echo "==> usage is reported as the tokens this session consumes (shown when you stop it)."
 
   echo "==> state dir : $AISESSION_STATE_DIR   (user $U)"
-  echo "==> [1/2] starting vLLM session ($MODEL TP=$TP $CONSTRAINT, ctx=$MAX_MODEL_LEN${AGENT_FLAG:+, tool-calling}, walltime=$TIME) -- SU-billed; blocks until READY"
+  echo "==> [1/2] starting vLLM session ($MODEL TP=$TP $CONSTRAINT, ctx=$MAX_MODEL_LEN${AGENT_FLAG:+, tool-calling}, walltime=$TIME) -- blocks until READY"
   # pipefail makes the pipeline fail if `start` fails even though tee succeeds.
   # $AGENT_FLAG is intentionally unquoted so an empty value expands to nothing.
   $PY "$HERE/ai_session.py" start \
       --model "$MODEL" --tp "$TP" --constraint "$CONSTRAINT" \
-      --max-model-len "$MAX_MODEL_LEN" $AGENT_FLAG \
+      --max-model-len "$MAX_MODEL_LEN" $AGENT_FLAG $CPU_FLAG \
       --wait --ready-timeout "$READY_TIMEOUT" 2>&1 | tee "$RUN_DIR/start.log"
   if ! grep -q '"active": true' "$UPSTREAM" 2>/dev/null; then
     echo "ERROR: session did not publish an active backend ($UPSTREAM); aborting." >&2
@@ -204,47 +215,33 @@ do_up() {
     echo "    gateway healthy (pid $GW_PID)  log: $RUN_DIR/gateway.log"
     echo "gateway $GW_PID" > "$PIDFILE"
   fi
+  write_progress ready "gateway is up" \
+    "\"kind\": \"code\", \"login\": \"$(hostname -s)\", \"gw_port\": $GW_PORT, \"user\": \"$U\""
 
   local login; login=$(hostname -s)
+  # opencode/Cline need server-side tool calling, which only an --agent session has.
+  OPENCODE_NOTE=""
+  [ "$AGENT_CLIENT" = "1" ] || OPENCODE_NOTE="  -- needs a session started with --agent"
   cat <<EOF
 
-================ READY -- code with the local ${MODEL} (ctx ${MAX_MODEL_LEN}) ================
+================ READY -- coding session: ${MODEL} ================
 
-  SESSION ACCESS KEY:  ${KEY}
+  In your git repository on this login node ($login):
 
-  The gateway now REQUIRES this key. Share it with your lab so they can use THIS
-  session over their OWN SSH tunnel to :${GW_PORT}; each member sets it as the
-  OpenAI API key in their client (OPENAI_API_KEY / the client's API-key field).
-  ALL of their usage bills to YOU ($U), the starter. Without the key the gateway
-  refuses every request (401). Saved (mode 600, only you can read) at:
-      ${KEYFILE}
+    eval "\$(ai-session env)"     # loads the URL, access key and model
 
-The session + gateway are up. aider is INTERACTIVE -- run it yourself in the
-git repo you want to edit. On THIS login node ($login), in your repo dir:
+  then start a client:
 
-  cd /path/to/your/repo        # a git repo (aider needs one; 'git init' if new)
-  OPENAI_API_BASE=http://localhost:${GW_PORT}/v1 OPENAI_API_KEY=${KEY} \\
-    ${AIDER_BIN} \\
-      --model openai/${MODEL} --weak-model openai/${MODEL} \\
-      --model-metadata-file ${METADATA} \\
-      --edit-format ${EDIT_FORMAT} --analytics-disable
+    opencode      (first: module load opencode)${OPENCODE_NOTE}
+    aider
 
-One-shot (non-interactive) mode -- good for scripts/batch, no REPL:
-  OPENAI_API_BASE=http://localhost:${GW_PORT}/v1 OPENAI_API_KEY=${KEY} \\
-    ${AIDER_BIN} --model openai/${MODEL} --weak-model openai/${MODEL} \\
-      --model-metadata-file ${METADATA} --edit-format ${EDIT_FORMAT} --analytics-disable \\
-      --yes-always --no-auto-commit --message "add a docstring to foo() in bar.py"
+  From your laptop instead, open a tunnel first, then copy the settings
+  that \`ai-session connect\` prints:
 
-Other clients can use the SAME endpoint (see ai-session/CODING_AGENTS.md):
-  base URL  http://localhost:${GW_PORT}/v1     API key  ${KEY}     model  ${MODEL}
+    ssh -N -f -L ${GW_PORT}:localhost:${GW_PORT} ${U}@${login}.rcc.uchicago.edu
 
-(If you'd rather run aider on your LAPTOP, first tunnel the gateway port (one login, -f backgrounds it):
-  ssh -N -f -L ${GW_PORT}:localhost:${GW_PORT} ${U}@${login}.rcc.uchicago.edu
- then use the same command on your laptop against http://localhost:${GW_PORT}/v1.)
-
-The SU clock is running. When done (frees the GPU, stops billing):
-
-  bash $HERE/run_coding_agent.sh down
+  Access key: ${KEY}
+  (lab members may use it too; their usage is recorded under you, $U)
 =======================================================================
 EOF
 }
@@ -283,6 +280,7 @@ do_down() {
 
   # remove the per-session access key -- it only applied to the session just ended.
   [ -f "$KEYFILE" ] && { rm -f "$KEYFILE"; echo "    removed session access key ($KEYFILE)"; }
+  rm -f "$PROGRESS_FILE"
 
   # --- the whole point of `down`: report the SU charge, LAST, so it can't scroll off ---
   # print_su_receipt.py renders the newest receipt only if it's newer than the
@@ -300,7 +298,7 @@ do_status() {
   echo
   echo "-- session access key ($KEYFILE) --"
   if [ -f "$KEYFILE" ]; then
-    echo "  set: $(cut -c1-6 "$KEYFILE" 2>/dev/null)...  (first 6 chars only; shared with your lab, bills to you)"
+    echo "  set: $(cut -c1-6 "$KEYFILE" 2>/dev/null)...  (first 6 chars only; shared with your lab, usage recorded under you)"
   else
     echo "  (none -- keyless)"
   fi

@@ -12,6 +12,7 @@
 #   MODEL_KEY MODEL_PATH TP CONSTRAINT GRES ACCOUNT PARTITION TIME_LIMIT
 #   CPUS MEM MAX_MODEL_LEN GPU_MEM_UTIL ENFORCE_EAGER PORT
 #   ENABLE_LORA LORA_MODULES MAX_LORA_RANK    (fine-tuned adapter serving)
+#   DEVICE JOB_NAME SERVED_MODEL_NAME          (CPU smoke runs; see below)
 #
 # Standalone example:
 #   ./launch_ai_session.sh --model-key qwen2.5_72B \
@@ -49,6 +50,17 @@ ENABLE_LORA=${ENABLE_LORA:-0}
 LORA_MODULES=${LORA_MODULES:-}      # space-separated name=/abs/path pairs (no spaces in paths)
 MAX_LORA_RANK=${MAX_LORA_RANK:-16}  # must be >= the largest adapter r; CLI computes this
 PORT=${PORT:-}
+# DEVICE=cpu (`ai-session <verb> --cpu`) serves qwen2.5_0.5B on a CPU-only node
+# (e.g. the `amd` or `caslake` partition) with the vLLM CPU build (env vllm-cpu,
+# built by tools/build_vllm_cpu.sbatch). No --gres/--constraint is requested and
+# no GPU-SU is billed; it is for trying the service and testing client wiring.
+DEVICE=${DEVICE:-gpu}
+CPU_KVCACHE_GIB=${CPU_KVCACHE_GIB:-8}
+# Smoke/benchmark fences (CLAUDE.md): a job named '<registry-key>:<port>' is billed
+# by billing_sweep.py and picked up by discovery, and a served name equal to a
+# registry key looks like production. Both default to the production values.
+JOB_NAME=${JOB_NAME:-}
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
 
 # -- flag parsing (overrides env) ------------------------------------------- #
 while [ $# -gt 0 ]; do
@@ -107,6 +119,9 @@ if [ -z "${PORT}" ]; then
   PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
 fi
 
+JOB_NAME="${JOB_NAME:-${MODEL_KEY}:${PORT}}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL_KEY}}"
+
 # Per-session backend API key. The vLLM /v1 endpoint binds --host 0.0.0.0 (the
 # gateway on the login node must reach it, and compute<->compute is routable), and
 # the node:port is discoverable (job-name, squeue). WITHOUT auth any co-tenant
@@ -118,6 +133,43 @@ fi
 # and injects it when forwarding, so legitimate clients never handle it directly.
 BACKEND_KEY=$(openssl rand -hex 16)
 
+# Per-model CUDA-graph safety. MEASURED 2026-08-19 (bench_billing job 53537347, 2xH100
+# NVL TP=2): with CUDA graphs ON, vLLM auto-selects the FlashInfer "mnnvl" all-reduce
+# backend (flashinfer_all_reduce.py:121) and its fused allreduce+RMSNorm kernel dies with
+# an illegal memory access inside profile_cudagraph_memory ->
+# "trtllm_mnnvl_allreduce_fusion failed ... an illegal memory access was encountered".
+# The engine never becomes ready, so the user holds GPUs for the readiness timeout and is
+# floor-billed for a server that never served. mnnvl is a MULTI-node NVLink path being
+# picked on a single node; the same log also warns that symmetric-memory multicast is
+# unsupported here. --enforce-eager avoids cudagraph profiling entirely and is the config
+# every successful run of this model used (53440093, 53496745, 53533204, 53534097).
+# Revisit with compilation pass_config.fuse_allreduce_rms=false to try to recover CUDA
+# graphs; re-measure the rate_table row if that lands, since the rate is flag-bound.
+# Hopper needs the FlashInfer allreduce+RMSNorm fusion disabled, NOT eager mode.
+# config/vllm.py::enable_allreduce_rms_fusion turns that pass on only when
+#   TP>1 AND cuda AND flashinfer AND (capability==90 OR family 100)
+# i.e. Hopper only -- A100 (sm80) and A40 (sm86) can never reach it. On 2xH100 NVL the
+# fused kernel dies with an illegal memory access during cudagraph capture (job 53537347);
+# NVIDIA documents exactly this for NVLink-bridged H100/H200 at TP>=2 on vLLM 0.26.0.
+#
+# We previously worked around it with --enforce-eager, which in 0.26.0 disables BOTH
+# torch.compile and cudagraphs. MEASURED cost of that overreach (qwen3.8_27B, 2xH100, TP=2):
+#   --enforce-eager           prefill  8969.3  decode   894.7  alpha 10.02  SU/1k-out 0.001242
+#   fuse_allreduce_rms=false  prefill 11827.9  decode  3492.7  alpha  3.39  SU/1k-out 0.000318
+# i.e. 3.9x the decode throughput and 3.9x cheaper per output token, with cudagraph_mode
+# FULL_AND_PIECEWISE retained and zero illegal-memory events (job 53729212).
+# The rate_table h100 row is measured under THIS flag, so production must pass it too --
+# metering.py invalidates a record whose serve flags differ from the running engine.
+COMPILATION_FLAG=""
+case "${CONSTRAINT}:${MODEL_KEY}" in
+  *H100*:qwen3.5*|*H100*:qwen3.6*|*H100*:qwen3.8*|*H200*:qwen3.5*|*H200*:qwen3.6*|*H200*:qwen3.8*|*H100*:gemma4*|*H200*:gemma4*)
+    COMPILATION_FLAG='--compilation-config {"pass_config":{"fuse_allreduce_rms":false}}'
+    echo "[launch] ${MODEL_KEY} on Hopper: disabling the allreduce+RMSNorm fusion" >&2
+    echo "[launch]   (crashes cudagraph capture on NVLink-bridged H100/H200 at TP>=2);" >&2
+    echo "[launch]   CUDA graphs stay ON -- 3.9x the decode of the old eager workaround" >&2
+    ;;
+esac
+
 EAGER_FLAG=""
 if [ "${ENFORCE_EAGER}" = "1" ]; then EAGER_FLAG="--enforce-eager"; fi
 
@@ -126,12 +178,66 @@ if [ "${ENFORCE_EAGER}" = "1" ]; then EAGER_FLAG="--enforce-eager"; fi
 # NOTE: this changes the production serve config; throughput rates measured by
 # bench_billing (batch config) don't transfer -- but agent sessions are
 # interactive and floor-billed, so the token rate is moot for them.
+# Serving env follows the MODEL. The default vllm-probe env is vLLM 0.10.2, which
+# does not register Qwen3_5ForConditionalGeneration / Qwen3_5MoeForConditionalGeneration
+# -- serving a Qwen3.5-family model there reserves GPUs, fails on load, and FLOOR-BILLS
+# the user. Those models serve on vllm-serve-cu129 (vLLM 0.26.0, cu129), the env every
+# model-refresh Gate-1/2 run used. Everything else keeps the proven 0.10.2 path.
+case "${MODEL_KEY}" in
+  qwen3.5*|qwen3.6*|qwen3.8*|gemma4*)
+    ENV_PATH=/project/rcc/mehta5/conda-envs/vllm-serve-cu129
+    echo "[launch] model ${MODEL_KEY} requires vLLM 0.26.0; ENV_PATH=${ENV_PATH}" >&2
+    ;;
+esac
+
+# CPU mode: GPU-only resources and flags are dropped; the KV cache is sized in
+# GiB of host RAM (VLLM_CPU_KVCACHE_SPACE) instead of a GPU memory fraction.
+SLURM_GPU_ARGS=(--constraint="${CONSTRAINT}" --gres="${GRES}")
+GPU_MEM_FLAG="--gpu-memory-utilization ${GPU_MEM_UTIL}"
+CPU_ENV_EXPORTS=""
+if [ "${DEVICE}" = "cpu" ]; then
+  # Same allow-list as server.CPU_SERVED (checked again here so a direct launcher
+  # call cannot park a large model on a CPU node).
+  case "${MODEL_KEY}" in
+    qwen2.5_0.5B) ;;
+    *) echo "ERROR: DEVICE=cpu serves only qwen2.5_0.5B (got ${MODEL_KEY})" >&2; exit 2 ;;
+  esac
+  ENV_PATH=/project/rcc/mehta5/conda-envs/vllm-cpu
+  SLURM_GPU_ARGS=()
+  GPU_MEM_FLAG=""
+  CONSTRAINT=cpu GRES="" TP=1
+  # env/lib first: the CPU build is compiled with gcc 13 and needs its libstdc++
+  # (GLIBCXX_3.4.29); el8's /lib64 copy is too old and the import fails.
+  CPU_ENV_EXPORTS="export VLLM_CPU_KVCACHE_SPACE=${CPU_KVCACHE_GIB} LD_LIBRARY_PATH=${ENV_PATH}/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+  # Bind OpenMP to exactly the CPUs Slurm granted. VLLM_CPU_OMP_THREADS_BIND=auto
+  # picked an EMPTY core list inside a partial-node allocation (job 59858393:
+  # "core ids=[]"), then set OMP_NUM_THREADS to an invalid value and the worker died.
+  CPU_ENV_EXPORTS="${CPU_ENV_EXPORTS}
+export VLLM_CPU_OMP_THREADS_BIND=\$(python -c 'import os; print(\",\".join(map(str, sorted(os.sched_getaffinity(0)))))')
+echo \"[job] VLLM_CPU_OMP_THREADS_BIND=\$VLLM_CPU_OMP_THREADS_BIND\" >&2"
+  echo "[launch] DEVICE=cpu: ENV_PATH=${ENV_PATH}, no GPU requested, KV cache ${CPU_KVCACHE_GIB} GiB" >&2
+fi
+
 AGENT_FLAGS=""
 if [ "${AGENT_CLIENT}" = "1" ]; then
   case "${MODEL_KEY}" in
-    qwen3*)  TOOL_PARSER="hermes" ;;   # qwen3coder parser also available
+    # Qwen3.5/3.6/3.8 family emit XML tool calls:
+    #   <tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>
+    # The hermes parser json.loads() the text between the tags, so it CANNOT parse
+    # this -- it returns tool_calls=[] with the XML left in content, the same silent
+    # failure that broke opencode on Qwen2.5-Coder. MEASURED job 53534097: hermes
+    # MODEL_EMITS_PARSER_MISMATCH (0 calls, raw tag present); qwen3_coder PARSER_WORKS
+    # (correct name+args, and no spurious call on a no-tool prompt).
+    # Gemma 4 emits a THIRD tool-call dialect: <tool_call>call:NAME{...}. Neither hermes
+    # (JSON) nor qwen3_coder (XML) parses it. MEASURED job 53544725: the gemma4 parser
+    # returns correct name+args on both tool cases and no spurious call on a no-tool prompt;
+    # functiongemma returns nothing at all.
+    gemma4*)  TOOL_PARSER="gemma4" ;;
+    qwen3.5*|qwen3.6*|qwen3.8*)  TOOL_PARSER="qwen3_coder" ;;
+    # Qwen3-32B emits JSON inside <tool_call> (0 XML markers in its template), so
+    # hermes IS correct for it -- do not fold it into the arm above.
+    qwen3*)  TOOL_PARSER="hermes" ;;
     qwen*)   TOOL_PARSER="hermes" ;;   # Qwen2.5 uses the hermes parser
-    llama*)  TOOL_PARSER="llama3_json" ;;
     *)       TOOL_PARSER="hermes" ;;
   esac
   AGENT_FLAGS="--enable-auto-tool-choice --tool-call-parser ${TOOL_PARSER}"
@@ -171,6 +277,19 @@ case "${MODEL_KEY}" in
     REASONING_FLAG="--reasoning-parser qwen3"
     echo "[launch] Qwen3 reasoning parser enabled (reasoning split from the answer)" >&2
     ;;
+  # Gemma 4 has its own reasoning parser (vLLM reasoning/__init__.py: gemma4 ->
+  # Gemma4ParserReasoningAdapter). It emits the chain of thought on a separate
+  # <|channel>thought ... <channel|> channel. VERIFIED job 53587542: with this parser the
+  # CoT lands in `reasoning` (2540 chars) and the answer alone in `content`. Without it the
+  # CoT would contaminate content. Needed even though enable_thinking defaults to FALSE,
+  # because the template also turns thinking on whenever tools or a system message are
+  # present -- i.e. exactly in agent sessions.
+  gemma4*)
+    REASONING_FLAG="--reasoning-parser gemma4"
+    echo "[launch] Gemma 4 reasoning parser enabled (thinking is OFF by default; enable it" >&2
+    echo "[launch]   per request with chat_template_kwargs.enable_thinking=true -- MEASURED" >&2
+    echo "[launch]   cost 5-12x tokens and wall time, so leave it off unless you need it)" >&2
+    ;;
 esac
 
 echo "[launch] submitting ${MODEL_KEY} TP=${TP} constraint=${CONSTRAINT} gres=${GRES} port=${PORT}" >&2
@@ -179,13 +298,12 @@ JID=$(
   sbatch --parsable \
     --account="${ACCOUNT}" \
     --partition="${PARTITION}" \
-    --constraint="${CONSTRAINT}" \
-    --gres="${GRES}" \
+    "${SLURM_GPU_ARGS[@]}" \
     --cpus-per-task="${CPUS}" \
     --mem="${MEM}" \
     --time="${TIME_LIMIT}" \
     --nodes=1 --ntasks=1 \
-    --job-name "${MODEL_KEY}:${PORT}" \
+    --job-name "${JOB_NAME}" \
     --output "${LOGDIR}/${MODEL_KEY}-%j.out" \
     --error  "${LOGDIR}/${MODEL_KEY}-%j.err" \
     --export=ALL,HF_HOME=${HF_CACHE},HUGGINGFACE_HUB_CACHE=${HF_CACHE},TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE} \
@@ -206,6 +324,7 @@ mamba activate ${ENV_PATH}
 # checks paths under /v1, so /metrics and /health stay open for the metering
 # scrape and the readiness poll.
 export VLLM_API_KEY="${BACKEND_KEY}"
+${CPU_ENV_EXPORTS}
 
 # Production serve flags. A rate_table.json record is only valid for the exact serve
 # flags AND vLLM version it was measured under, so these must stay consistent with
@@ -217,18 +336,18 @@ export VLLM_API_KEY="${BACKEND_KEY}"
 # the metering scrape can reach it; /v1 is protected by VLLM_API_KEY above. Stats stay
 # ON so /metrics is populated.
 vllm serve ${MODEL_PATH} \
-  --served-model-name ${MODEL_KEY} \
+  --served-model-name ${SERVED_MODEL_NAME} \
   --host 0.0.0.0 \
   --port ${PORT} \
   --tensor-parallel-size ${TP} \
   --enable-prefix-caching \
   --trust-remote-code \
   --max-model-len ${MAX_MODEL_LEN} \
-  --gpu-memory-utilization ${GPU_MEM_UTIL} \
+  ${GPU_MEM_FLAG} \
   ${AGENT_FLAGS} \
   ${LORA_FLAGS} \
   ${REASONING_FLAG} \
-  ${EAGER_FLAG}
+  ${EAGER_FLAG} ${COMPILATION_FLAG}
 EOF
 )"
 )
@@ -240,9 +359,10 @@ echo "[launch] submitted jobid=${JID}" >&2
 # so ai_session can publish it to the gateway (upstream.json, 0600); ai_session
 # does NOT persist it in the on-disk session file. This line is captured by
 # ai_session (never echoed) and not written to any shared log.
-python3 - "$JID" "$PORT" "$MODEL_KEY" "$MODEL_PATH" "$CONSTRAINT" "$TP" "$GRES" "$ACCOUNT" "$PARTITION" "$SERVER_LOG" "$ENFORCE_EAGER" "$BACKEND_KEY" <<'PY'
+python3 - "$JID" "$PORT" "$MODEL_KEY" "$MODEL_PATH" "$CONSTRAINT" "$TP" "$GRES" "$ACCOUNT" "$PARTITION" "$SERVER_LOG" "$ENFORCE_EAGER" "$BACKEND_KEY" "$SERVED_MODEL_NAME" "$DEVICE" <<'PY'
 import json, sys
-(_, jid, port, mk, mp, constraint, tp, gres, acct, part, log, eager, backend_key) = sys.argv
+(_, jid, port, mk, mp, constraint, tp, gres, acct, part, log, eager, backend_key,
+ served, device) = sys.argv
 gpus = int(gres.split(":")[-1]) if ":" in gres else None
 print(json.dumps({
     "jobid": jid, "port": int(port), "model_key": mk, "model_path": mp,
@@ -250,5 +370,6 @@ print(json.dumps({
     "tp": int(tp), "gres": gres, "n_gpus_requested": gpus,
     "account": acct, "partition": part, "server_log": log,
     "enforce_eager": eager == "1", "backend_key": backend_key,
+    "served_model_name": served, "device": device,
 }))
 PY

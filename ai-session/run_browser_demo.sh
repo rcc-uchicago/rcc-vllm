@@ -23,6 +23,7 @@
 #   and each user gets PER-USER default ports (derived from your UID) so two people
 #   on the same login node don't collide. Override any of these via env:
 #       AISESSION_STATE_DIR  GW_PORT  OWUI_PORT  MODEL  TP  CONSTRAINT  READY_TIMEOUT
+#       OWUI_READY_TIMEOUT  AISESSION_SHARED_HF_CACHE
 #
 #   e.g. the big model:  MODEL=qwen2.5_72B TP=4 CONSTRAINT=A100 bash .../run_browser_demo.sh up
 #
@@ -71,10 +72,35 @@ OWUI_PORT=${OWUI_PORT:-$((3000 + UID_NUM % 90))}
 # so `down` can reap a stray mcpo by port even when the pidfile is gone.
 MCPO_PORT=${MCPO_PORT:-$((OWUI_PORT + 500))}
 export GW_PORT MCPO_PORT
-READY_TIMEOUT=${READY_TIMEOUT:-900}
+# Model-aware default for how long `start` waits for the model to load + compile
+# before giving up. Large models with torch.compile (72B cold start ~13-15min)
+# need well over the old flat 900s, or the wait times out just before READY. An
+# explicit READY_TIMEOUT in the env still wins. (MODEL is resolved above.)
+if [ -z "${READY_TIMEOUT:-}" ]; then
+  case "$MODEL" in
+    qwen3.5_122B)                 READY_TIMEOUT=2400 ;;  # 122B MoE on H200
+    qwen2.5_72B)                  READY_TIMEOUT=1500 ;;  # 72B dense, ~15min cold start
+    qwen3.8_27B)                  READY_TIMEOUT=1800 ;;  # 27B hybrid GDN: Triton JIT warmup is slow
+    gemma4_31B)                   READY_TIMEOUT=1800 ;;  # 30.7B: ~130s load + engine init, cold JIT on a new arch
+    *)                            READY_TIMEOUT=900  ;;   # small (4b/0.5B)
+  esac
+fi
+# How long to wait for Open WebUI to bind its port before failing `up`. A cold
+# first run (heavy imports + first-run DB migration on NFS, and -- absent a shared
+# cache -- an embedding-model download) can exceed the old hardcoded 180s; make it
+# tunable and default higher so a slow-but-fine start is not torn down prematurely.
+OWUI_READY_TIMEOUT=${OWUI_READY_TIMEOUT:-300}
 ACTION=${1:-up}
 
 # --- helpers ---------------------------------------------------------------- #
+# Bring-up progress for `ai-session status` (same file ai_session.py writes while
+# the model loads). state: queued | loading | model_ready | ready | failed.
+PROGRESS_FILE="$RUN_DIR/progress.json"
+write_progress() {   # state  message  [extra-json-fields]
+  printf '{"state": "%s", "message": "%s", "updated": %s%s}\n' \
+    "$1" "$2" "$(date +%s)" "${3:+, $3}" > "$PROGRESS_FILE.tmp" && mv "$PROGRESS_FILE.tmp" "$PROGRESS_FILE"
+}
+
 port_busy() { ss -ltn 2>/dev/null | grep -q ":$1 "; }       # is anything listening on :$1 ?
 
 wait_port() {   # port  timeout_s  label
@@ -139,13 +165,13 @@ do_up() {
     echo "ERROR: model '$MODEL' is not fully staged at: ${MODEL_DIR:-<unknown>}" >&2
     echo "       (missing config.json/*.safetensors, or a download is still in flight)." >&2
     echo "       Wait for staging to finish, or pick a staged model, e.g.:" >&2
-    echo "           MODEL=qwen2.5_72B TP=4 bash $HERE/run_browser_demo.sh up" >&2
+    echo "           ai-session chat --model qwen2.5_72B" >&2
     exit 1
   fi
   if port_busy "$GW_PORT" || port_busy "$OWUI_PORT"; then
     echo "Something is already listening on :$GW_PORT or :$OWUI_PORT (maybe another user on this node)." >&2
-    echo "Either '$HERE/run_browser_demo.sh down', or pick free ports:" >&2
-    echo "    GW_PORT=8490 OWUI_PORT=3090 bash $HERE/run_browser_demo.sh up" >&2
+    echo "Either stop your running session with 'ai-session stop', or pick free ports:" >&2
+    echo "    GW_PORT=8490 OWUI_PORT=3090 ai-session chat" >&2
     exit 1
   fi
 
@@ -154,17 +180,20 @@ do_up() {
   # session); the walltime is $TIME (exported as TIME_LIMIT), the same value
   # ai_session.py bills against. A whole-node reservation can bill a larger N;
   # token work only adds above the floor.
-  echo "==> pre-flight: $($PY "$HERE/preflight_estimate.py" --constraint "$CONSTRAINT" --n "$TP" --time "$TIME")"
+  # AISESSION_CPU=1 (`ai-session <verb> --cpu`): CPU-only session, no GPU reserved.
+  CPU_FLAG=""
+  [ "${AISESSION_CPU:-0}" = "1" ] && CPU_FLAG="--cpu"
+  echo "==> usage is reported as the tokens this session consumes (shown when you stop it)."
 
   AGENT_FLAG=""
   if [ "$AGENT_CLIENT" = "1" ]; then AGENT_FLAG="--agent-client"; fi
 
   echo "==> state dir : $AISESSION_STATE_DIR   (user $U)"
-  echo "==> [1/3] starting vLLM session ($MODEL TP=$TP $CONSTRAINT${AGENT_FLAG:+, tool-calling}, walltime=$TIME) -- SU-billed; blocks until READY"
+  echo "==> [1/3] starting vLLM session ($MODEL TP=$TP $CONSTRAINT${AGENT_FLAG:+, tool-calling}, walltime=$TIME) -- blocks until READY"
   # pipefail makes the pipeline fail if `start` fails even though tee succeeds.
   # $AGENT_FLAG is intentionally unquoted so an empty value expands to nothing.
   $PY "$HERE/ai_session.py" start \
-      --model "$MODEL" --tp "$TP" --constraint "$CONSTRAINT" $AGENT_FLAG \
+      --model "$MODEL" --tp "$TP" --constraint "$CONSTRAINT" $AGENT_FLAG $CPU_FLAG \
       --wait --ready-timeout "$READY_TIMEOUT" 2>&1 | tee "$RUN_DIR/start.log"
   if ! grep -q '"active": true' "$UPSTREAM" 2>/dev/null; then
     echo "ERROR: session did not publish an active backend ($UPSTREAM); aborting." >&2
@@ -177,7 +206,7 @@ do_up() {
   # only now: earlier, `down` could have ended a PRE-EXISTING session (e.g. when
   # `start` refuses because one is already running). Cleared before READY prints.
   trap 'rc=$?; trap - EXIT; if [ "$rc" -ne 0 ]; then
-          echo "==> up failed (rc=$rc) -- tearing the stack down so nothing keeps billing" >&2
+          echo "==> up failed (rc=$rc) -- tearing the stack down so nothing keeps running" >&2
           do_down || true
         fi' EXIT
 
@@ -214,17 +243,21 @@ do_up() {
     echo "    gateway healthy (pid $GW_PID)  log: $RUN_DIR/gateway.log"
   fi
 
-  echo "==> [3/3] starting Open WebUI on 127.0.0.1:$OWUI_PORT (heavy imports -- ~30-60s)"
+  echo "==> [3/3] starting Open WebUI on 127.0.0.1:$OWUI_PORT (heavy first-run imports -- up to ${OWUI_READY_TIMEOUT}s)"
+  echo "    The model is loaded, but the web page is still NOT ready -- please wait for the READY box."
+  write_progress model_ready "model loaded; starting the web page (Open WebUI)"
   # run_openwebui.sh reads GW_PORT (exported) + AISESSION_STATE_DIR, then `exec`s
   # open-webui, so $! IS the UI process.
   nohup bash "$HERE/run_openwebui.sh" "$OWUI_PORT" \
       > "$RUN_DIR/openwebui.log" 2>&1 &
   OWUI_PID=$!
   echo "openwebui $OWUI_PID" >> "$PIDFILE"
-  wait_port "$OWUI_PORT" 180 "Open WebUI"
+  wait_port "$OWUI_PORT" "$OWUI_READY_TIMEOUT" "Open WebUI"
   echo "    Open WebUI serving (pid $OWUI_PID)  log: $RUN_DIR/openwebui.log"
 
   trap - EXIT   # the stack is fully up; failures past here are not up-failures
+  write_progress ready "web page is up" \
+    "\"kind\": \"chat\", \"login\": \"$(hostname -s)\", \"owui_port\": $OWUI_PORT, \"gw_port\": $GW_PORT, \"user\": \"$U\""
 
   local login; login=$(hostname -s)
   cat <<EOF
@@ -237,7 +270,7 @@ do_up() {
   so YOUR browser tab works out of the box. To let your lab use THIS session,
   share this key: each member points their own client at the gateway (their own
   SSH tunnel to :${GW_PORT}) and sets this as the OpenAI API key. ALL of their
-  usage bills to YOU ($U), the starter. Without the key the gateway refuses every
+  usage is recorded under YOU ($U), the starter. Without the key the gateway refuses every
   request (401). Saved (mode 600, only you can read) at:
       ${KEYFILE}
 
@@ -246,10 +279,6 @@ On your LAPTOP, open the tunnel to THIS login node ($login) -- one login, -f bac
   ssh -N -f -L ${OWUI_PORT}:localhost:${OWUI_PORT} ${U}@${login}.rcc.uchicago.edu
 
 then browse:   http://localhost:${OWUI_PORT}      (pick model '${MODEL}')
-
-The SU clock is running. When done (frees the GPU, stops billing):
-
-  bash $HERE/run_browser_demo.sh down
 ==============================================================
 EOF
 }
@@ -300,6 +329,7 @@ do_down() {
 
   # remove the per-session access key -- it only applied to the session just ended.
   [ -f "$KEYFILE" ] && { rm -f "$KEYFILE"; echo "    removed session access key ($KEYFILE)"; }
+  rm -f "$PROGRESS_FILE"
 
   # --- the whole point of `down`: report the SU charge, LAST, so it can't scroll off ---
   # print_su_receipt.py renders the newest receipt only if it's newer than the
@@ -316,7 +346,7 @@ do_status() {
   echo
   echo "-- session access key ($KEYFILE) --"
   if [ -f "$KEYFILE" ]; then
-    echo "  set: $(cut -c1-6 "$KEYFILE" 2>/dev/null)...  (first 6 chars only; shared with your lab, bills to you)"
+    echo "  set: $(cut -c1-6 "$KEYFILE" 2>/dev/null)...  (first 6 chars only; shared with your lab, usage recorded under you)"
   else
     echo "  (none -- keyless)"
   fi

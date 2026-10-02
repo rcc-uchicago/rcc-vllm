@@ -1,5 +1,426 @@
 # Changelog
 
+## Unreleased — model-refresh (branch milestone/model-refresh)
+
+### CUDA graphs recovered — 3.9x decode on the coding model (2026-08-20)
+
+`--enforce-eager` was the wrong workaround. It was adopted on 2026-08-19 to dodge a crash in
+the FlashInfer allreduce+RMSNorm fusion, but in vLLM 0.26.0 it disables BOTH torch.compile
+and CUDA graphs ("equivalent to -cc.mode=none -cc.cudagraph_mode=none") — so we discarded
+Inductor and every unrelated fusion to avoid one pass. NVIDIA documents the targeted fix for
+exactly this hardware class (NVLink-bridged H100/H200, TP>=2, still present in 0.26.0):
+
+    --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}'
+
+MEASURED on qwen3.8_27B, 2xH100 NVL, TP=2 (job 53729212), with `fuse_allreduce_rms: False`,
+`cudagraph_mode: FULL_AND_PIECEWISE` and ZERO illegal-memory events confirmed in the log:
+
+| | --enforce-eager | fusion disabled | change |
+|---|---|---|---|
+| prefill | 8969.3 | 11827.9 | +31.9% |
+| decode | 894.7 | **3492.7** | **+290%** |
+| alpha | 10.02 | 3.39 | back in family |
+| SU/1k out | 0.001242 | **0.000318** | **3.9x cheaper** |
+
+The alpha of 10.02 flagged in yesterday's entry as "wildly out of family" was exactly the
+symptom it looked like. **qwen3.8_27B on h100 is now the cheapest capable coding
+configuration in the fleet** (0.000318), ahead of gemma4_31B on a40 (0.000797) despite 4x
+the tier weight. The h100 rate row is re-measured under this flag and the launcher passes it,
+because metering.py invalidates a record whose serve flags differ from the running engine.
+
+**The pin is also now Hopper-only.** `config/vllm.py::enable_allreduce_rms_fusion` requires
+`is_device_capability(90)` or family 100, so A100 (sm80) and A40 (sm86) can never reach the
+failing pass. The previous family-wide pin cost us CUDA graphs on Ampere for a bug that
+cannot occur there — which means **both gemma4_31B rate rows (a40, a100) are understated**,
+their alphas of 6.60 and 9.92 showing the same signature. The re-measure was queued and
+cancelled when the campaign closed; those two rows remain conservative.
+
+**Qwen3.5-122B also runs with CUDA graphs** (job 53742253, PASS, zero illegal-memory). Its
+eager pin was pre-emptive and is likewise unnecessary; it needs only `--max-num-seqs 384`,
+because each decode sequence of a hybrid Gated-DeltaNet model consumes one Mamba cache block
+and 1024 > the 389 available. Not yet unpinned in the launcher.
+
+### QAT 4-bit Gemma serves on ONE A40 (2026-08-20)
+
+`google/gemma-4-31B-it-qat-w4a16-ct` staged (22 GB, Gate-D PASS): compressed-tensors
+pack-quantized, 4-bit, group_size 32, vision tower and lm_head in the ignore list.
+Quantization-AWARE training, so quality should be near-lossless — but Google publishes NO
+quantized-vs-BF16 benchmark, so that is an assumption, not a measurement.
+
+Gate-1 PASS at TP=1 on a single A40 (job 53742254): `Using MarlinLinearKernel for
+CompressedTensorsWNA16`, weights 18.7 GiB, **KV cache 16.25 GiB = 45,488 tokens**. Against
+BF16 Gemma on TWO A40s (51,325 tokens), that is nearly the same cache on half the hardware:
+
+| config | GPUs | floor | KV tokens |
+|---|---|---|---|
+| gemma4_31B BF16, 2x A40 | 2 | 1.0 SU/h | 51,325 |
+| **QAT 4-bit, 1x A40** | **1** | **0.5 SU/h** | 45,488 |
+
+A first attempt OOM'd; the cause was multimodal profiling (vLLM allocates dummy image/video
+inputs at startup), fixed by `--language-model-only`. Marlin kernel selection was never the
+problem — that was the real uncertainty and it is settled: 4-bit compressed-tensors works on
+sm86. NOT wired in: quality is unmeasured, and the frozen LCB-60 gauntlet is the only
+acceptable evidence before a 0.5 SU/h tier is offered to users.
+
+### GPU targets are now an allowlist, not a preference order (2026-08-20)
+
+An audit of where jobs actually landed found **103 historical jobs on pi-gagalli and
+pi-lgagliardi hardware — 85 of them on H200 nodes** — all routed through the `test`
+partition, which spans nearly the whole cluster, without ever naming those partitions. The
+H200 rule alone did not prevent this; five A100-80GB landings on gagalli nodes happened on
+2026-08-19 while that rule was in force.
+
+CLAUDE.md now permits exactly three GPU targets: `pedramh-gpu` (an account the user holds),
+`beagle3` (consortium, nobody's), and `gpu` (AllowAccounts=ALL, one usable node). `test` is
+CPU-only from here. Also forbidden: H200 without per-job permission, another group's nodes
+even when idle, and the `beagle3-prio` QOS.
+
+**`--qos=beagle3` is not sufficient on its own** — the site's job-submit plugin overrides it
+back to `beagle3-prio` (priority 100,000,000 vs 0). The `scontrol update jobid=<id>
+QOS=beagle3` correction after submission is mandatory, not a fallback. Caught by running the
+allowlist check against our own in-flight jobs.
+
+### Harness
+
+`tools/serve_cu129.sbatch` gains an `EXTRA_SERVE_ARGS` passthrough. Without it a 122B job was
+submitted with CUDA graphs ON and the broken fusion ALSO on — it would have crashed exactly
+as the original bug does and read as "the vendor workaround does not help this model".
+Cancelled before it ran.
+
+### Gemma-4-31B-it added as a SECOND coding option (2026-08-20)
+
+Not a replacement. `qwen3.8_27B` remains the `code` preset default; Gemma is reached with
+`ai-session code --model gemma4_31B`. Four models served.
+
+**Why it is not the default despite scoring higher.** Gemma took Gate-2 at 66.67% (40/60)
+against the 27B's 50.00% on the identical frozen LCB-60 subset, decode and harness — but the
+frozen decode pins `enable_thinking:false`, which is Gemma's NATIVE default and a suppression
+of Qwen3.8's `xhigh` default. The 27B's 50.00% is therefore a lower bound and the 16.67-point
+gap is not like-for-like. A thinking-on Qwen rerun is owed before any swap is justified.
+
+**Wiring.** `gemma4_31B` in `MODEL_REGISTRY` + `PHASE1_SERVED`; TP=2; tool parser `gemma4`;
+reasoning parser `gemma4`; serving env routed to `vllm-serve-cu129` (0.10.2 predates Gemma 4
+entirely); `READY_TIMEOUT` 1800.
+
+**Tier pin is `"a40|a100"` — lowercase deliberately.** Uppercase `A100` is midway3's 80GB
+cards, which sit in PI-owned partitions; per the node-ownership rule in CLAUDE.md those must
+not be a default target. Lowercase `a40`/`a100` are beagle3 consortium hardware, 22 nodes each,
+owned by nobody and reachable by ordinary users.
+
+**A40 is both the cheaper AND the roomier tier for this model** — the reverse of the usual
+ordering, because Gemma is heavy (58.25 GiB, 30.38 GiB/GPU at TP=2) and an A40 card (46 GiB)
+is larger than a 40GB A100. MEASURED KV headroom at TP=2:
+  a40  (46 GiB)  9.17 GiB KV = 51,325 tokens, 3.13x concurrency @16K, tier weight 0.5
+  a100 (40 GiB)  4.71 GiB KV = 26,342 tokens, 1.61x concurrency @16K, tier weight 1.0
+The a100 figure is tight: 1.61x means barely more than one full-context request at a time.
+
+**Both rate rows measured, and A40 beats A100-40GB on EVERY axis for this model** — a real
+inversion of the usual tier ordering, worth recording because it is the opposite of what one
+would assume:
+
+| | a40 (job 53710675) | a100 40GB (job 53707470) |
+|---|---|---|
+| prefill | 2301.17 | 3336.88 |
+| decode | **348.67** | 336.21 |
+| alpha | 6.60 | 9.92 |
+| KV cache | **9.17 GiB / 51,325 tok** | 4.71 GiB / 26,342 tok |
+| su_per_1k_out | **0.000797** | 0.001652 |
+| floor | **1.0 SU/h** | 2.0 SU/h |
+
+A40 decodes FASTER despite weaker silicon, because an A40 card is 46 GiB against a 40 GiB
+A100 and this model needs 30.38 GiB/GPU — roughly double the cache left over, so at the
+benchmark's concurrency 64 the A40 keeps more requests in flight while the A100 thrashes.
+Note the a100 alpha of 9.92 (vs a40's 6.60) is the signature: prefill scales fine, decode is
+cache-starved. Combined with half the tier weight, A40 is **2.07x cheaper per output token**.
+
+Cost context across the fleet (SU per 1k output tokens): qwen3_4b a100 0.000054;
+qwen2.5_coder_32B a100 0.000331 (retired); **gemma4_31B a40 0.000797**; qwen2.5_72B a100
+0.000933; qwen2.5_72B h100 0.001227; qwen3.8_27B h100 0.001242; gemma4_31B a100 0.001652.
+Tier choice now matters more than model choice: the same Gemma is either the cheapest or
+nearly the dearest coding option depending purely on which card it lands on.
+
+**Thinking measured, not assumed** (job 53587542, new `tools/thinking_probe.{py,sbatch}`).
+The `gemma4` reasoning parser correctly separates the chain of thought into `reasoning`,
+leaving the answer alone in `content` — verified, not inferred; a broken parser would have
+silently contaminated every downstream score. Cost of enabling thinking: **10.4x tokens and
+11.8x wall time on an easy prompt, 5.1x/5.3x on a hard one**, with content length essentially
+unchanged (618 vs 616 chars on the hard prompt). Thinking spends roughly constant absolute
+effort regardless of difficulty, so the multiplier is worst on trivial requests -- the same
+pathology as Qwen's `xhigh`, though far smaller in absolute terms. Under GPU-time billing
+that is a 5-12x cost multiplier, so off-by-default is correct and the launcher now prints
+the measured cost when a user starts the model.
+
+**Hardware coverage complete for both coding models.** Gemma passes TP=2 on H100 NVL, A100
+80GB, A100 40GB and A40 (jobs 53544338, 53544339, 53586878, 53586877); Qwen3.8-27B passes the
+same four. Neither is restricted to hardware ordinary users cannot reach.
+
+Docs: both coding models in the model/hardware/licence tables, plus a "Choosing between the
+two coding models" section giving the honest trade — Qwen thinks by default and suits hard
+problems; Gemma is cheaper and faster by default and scored higher on our benchmark, with the
+comparison caveat stated.
+
+### Fleet consolidation, hardware coverage, and a new measured leader (2026-08-19, later)
+
+Follow-on to the coding cutover earlier the same day. Everything below is MEASURED.
+
+**Gemma-4-31B-it: Gate-2 PASS at 66.67% (40/60), +40.00 pts over the frozen baseline and
++16.67 over the Qwen3.8-27B incumbent adopted hours earlier.** Same frozen LCB-60 subset,
+SHA and content fingerprint, same greedy `enable_thinking:false` decode, same harness and
+serve env. By difficulty hard 14/30 (vs the 27B's 6/30), medium 14/18, easy 12/12 — the only
+model to sweep easy. Generation 53546905 plus tail resume 53554776 (`resume_kept=56`), score
+53554777. At ~2.8 sigma this is outside the n=60 noise band, unlike the 27B-vs-122B gap.
+Staged from `google/gemma-4-31B-it` (Apache-2.0, UNGATED), 58.25 GiB BF16, Gate-D byte-exact.
+Serves TP=2 on H100 (51.89 GiB KV) and A100 80GB (40.49 GiB KV, 226,696 tokens, 13.8x
+concurrency). Tool calling works with vLLM's `gemma4` parser; `functiongemma` returns nothing.
+Caveat: the frozen decode is Gemma's NATIVE default but suppresses Qwen3.8's `xhigh`, so the
+27B's 50.00% is a lower bound and a thinking-on rerun is owed before this is called final.
+
+**Qwen3.8-27B now verified on every GPU tier users can reach.** H100 NVL, A100 80GB (SXM4 and
+PCIe), A100 40GB (beagle3), and A40 — all PASS at TP=2. `constraint_for_model` moved from an
+H100 pin to `"A100|a100"`: H100 exists ONLY in PI-owned partitions, so the H100 pin made the
+default coding model unstartable for most users. A100 is reachable via beagle3 (22 nodes) and
+the open `gpu` partition, and halves the floor (tier weight 1.0 vs 2.0). A40 also passes, at
+0.5. NOTE: the rate row is still h100-only, so an A100 session bills the floor until an a100
+row is measured — still half the H100 floor, so a net saving either way.
+
+**Single-env consolidation measured.** All three served models now have vLLM 0.26.0 rate rows,
+and 0.26.0 is faster on both re-measured models: qwen3_4b a100 20063/4129 -> 22167/5114
+(+10.5% prefill, +23.9% decode); qwen2.5_72B a100 2901/1123 -> 2914/1191. Two needed a pinned
+flag to get there, both now mirrored into the launcher so production matches the measured row:
+  - `qwen3.8_27B` (and the whole qwen3.5 family) forced to `--enforce-eager`. With CUDA graphs
+    on, vLLM auto-selects the FlashInfer `mnnvl` allreduce and `trtllm_mnnvl_allreduce_fusion`
+    dies with an illegal memory access inside `profile_cudagraph_memory` (job 53537347). The
+    engine never becomes ready, so a user would hold GPUs through the readiness timeout and be
+    floor-billed for a server that never served. Costs decode (894.71 tok/s, alpha 10.02 —
+    out of family); `pass_config.fuse_allreduce_rms=false` is the untested recovery path.
+  - `qwen2.5_72B` pinned to `--gpu-memory-utilization 0.86`. At 0.90 it OOMs during cudagraph
+    capture on 0.26.0 by 76 MiB (job 53539312) where 0.10.2 was fine; 0.86 clears it with ~3 GiB
+    of margin and measured slightly FASTER than the old row.
+
+**Models deleted (total 1.48 TB reclaimed today, 1.79 TB -> 315 GB).** This entry adds
+Qwen3.6-35B-A3B (67G, unregistered and superseded), Meta-Llama-3.1-70B (263G: 132G of
+unreferenced `original/*.pth` duplicates plus the 132G model). Llama had ZERO recorded sessions
+in the central ledger, no rate row, and was the only licence-gated model here; note it is also
+the only deletion that is NOT a free re-download, since Meta gates the weights. Its removal
+touched the launcher tool-parser arm, the browser-demo timeout arm, the whole Llama 3.1 licence
+section in the docs, and four model tables. `_LICENSE_GATED` is retained, unused, for the next
+restrictively-licensed model.
+
+**H200 removed as a serving tier.** The h200 rate row is dropped and no model may pin that
+tier. `qwen3.5_122B` is re-pinned to `"H100|H200"` — it is native FP8 (E4M3, block-wise
+128x128, 96.8% of weights) and FP8 needs Hopper tensor cores, so it must never fall through to
+the preset's A100 default and floor-bill on a doomed load. It is validated at TP=2 on BOTH
+Hopper tiers (H200 job 53069683; H100 NVL job 53538328, 20.85 GiB KV = 1,016,978 tokens) but
+stays unserved pending a rate row. Docs now state plainly that only groups owning Hopper
+hardware can ever start it, and that `qwen3.8_27B` is the better choice anyway.
+
+**Production breakage found and fixed.** `bin/ai-session::do_code` still exported
+`MODEL=qwen2.5_coder_32B` after that model was deleted — `ai-session code` would have failed
+outright. Four further stale references in the same sweep: the usage text, `run_coding_agent.sh`,
+`run_browser_demo.sh`'s READY_TIMEOUT arm, and a `server.py` comment.
+
+**Harness hardening, each from a failure that cost a reservation.**
+  - Persistent Triton cache at `/project/rcc/mehta5/.serve-cache/triton` (was per-job `$TMPDIR`,
+    so every job recompiled from scratch). A cold sm80 cache blew vLLM's 600s engine-ready
+    timeout and killed the first Qwen A100 smoke (53539504); `VLLM_ENGINE_READY_TIMEOUT_S`
+    raised to 2400 alongside. The retry then passed in 7m54s.
+  - `$TMPDIR` namespaced to `/tmp/$USER-vllmjob/$SLURM_JOB_ID`. The node epilog sweeps
+    `/tmp/$USER*`, so a concurrent job of ours finishing on the same node deleted a running
+    benchmark's tmpdir; FlashAttention died mid-run (`flash_attn.py:1014`) after 27 of 60
+    problems, leaving 33 HTTP 500s that would have scored as wrong answers.
+  - GPU-visibility guard: abort before loading weights if `nvidia-smi` device count != TP.
+    Slurm reported `gres/gpu=2` while the cgroup exposed 1 on beagle3-0029 (job 53539505).
+  - `bench_billing.sbatch` routes the env by model key, with `FORCE_CU129=1` to measure a
+    0.10.2-era model against 0.26.0; `toolcall_probe.sbatch` parameterised by model/parsers.
+  - `serve_cu129.sbatch` gained a `gemma4` reasoning-parser arm.
+
+**CLAUDE.md: node-ownership rule.** The H200 restriction generalised — a staff-accessible
+partition spans most of the cluster, so a bare `--constraint` can silently land on another
+group's hardware. Adds the `scontrol show node | grep Partitions=` pre-submit check, a table of
+known per-node ownership, and a note not to use an elevated QOS (`beagle3-prio`, priority
+100,000,000) to jump the queue on shared hardware.
+
+**RTX 6000 nodes settled:** `Quadro RTX 6000, 24576 MiB, compute capability 7.5` (job 53544135)
+— Turing, not the RTX PRO 6000 Blackwell. fp16-only, no bf16, no FlashAttention 2/3, 24 GB.
+Unusable for every model here, confirming the existing `excluded_tiers` entry. The open `gpu`
+partition therefore offers exactly ONE usable node (midway3-0294, A100 40GB) to this service.
+
+### Coding incumbent cutover — Qwen3.8-27B replaces Qwen2.5-Coder-32B (2026-08-19)
+
+Measured on the frozen 60-problem LiveCodeBench subset (`subset_sha256=b3c2b753…7021b`,
+greedy, `enable_thinking:false`, `max_tokens` 8192, concurrency 1), scored by the same
+harness on `caslake`, `prereg-check` PASS before scoring. Score job 53531932.
+
+- **Qwen3.8-27B: 50.00% (30/60) vs baseline 26.67% (16/60), +23.33 pts.** By difficulty
+  hard 6/30, medium 13/18, easy 11/12. Best of six candidates; beats `qwen3.5_122B`
+  (45.00%) at 44% of its footprint, though that 5-pt gap is inside the n=60 noise band
+  (SE ≈ 6 pts near p=0.5). Generation job 53496745.
+- Also measured this round, previously unrecorded: Qwen3.6-35B-A3B 43.33%,
+  Qwen3-Coder-Next 36.67% (both Gate-2 PASS).
+
+**Tool calling — a defect found and fixed before it shipped.** `launch_ai_session.sh`
+mapped `qwen3*` to the `hermes` tool parser. Qwen3.8-27B emits tool calls in XML
+(`<tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>`); hermes
+`json.loads()` the text between the tags and structurally cannot parse it, which would
+have reproduced the silent empty-`tool_calls` failure that broke opencode on
+Qwen2.5-Coder. MEASURED job 53534097 across three parsers: `hermes`
+MODEL_EMITS_PARSER_MISMATCH (0 calls, raw XML in content); `qwen3_coder` and `qwen3_xml`
+PARSER_WORKS (correct name+args, no spurious call on a no-tool prompt). The glob is now
+split so the 3.5/3.6/3.8 family gets `qwen3_coder` while `qwen3_32B`, whose template
+emits JSON, kept `hermes` — folding them together would have broken a served model.
+The `AGENTS.md` tool-tag workaround is obsolete for this model and documented as such.
+
+**Serving env now follows the model.** `launch_ai_session.sh` hardcoded the vLLM 0.10.2
+`vllm-probe` env, which cannot load `Qwen3_5ForConditionalGeneration`. Serving the 27B
+there would have reserved GPUs, failed on load, and floor-billed. The launcher now routes
+the Qwen3.5-family to `vllm-serve-cu129` (0.26.0); every other model keeps 0.10.2.
+
+**MTP speculative decoding verified available** (not enabled). vLLM 0.26.0 resolves
+`Qwen3_5MTP` from our checkpoint's in-tree draft head (`mtp_num_hidden_layers: 1`).
+A/B on 2×H100, job 53533204: 90.36% draft acceptance (375/415), 23.22 vs 15.17 tok/s
+(+53%) under `--enforce-eager`. NOT enabled for benchmarking — it perturbed greedy output
+on 1 of 3 prompts, and the benchmark's value is that it is controlled by construction.
+Its place is the serving path, where a ~35% GPU-time reduction is a direct SU saving;
+that needs a rate measurement and a check against vLLM #46249 (MTP + tool calls) first.
+
+**Models deleted from disk (1.18 TB reclaimed, 1.79 TB → 644 GB).** GLM-5.2-FP8 (704 GB,
+never servable: 755 GB exceeds one 4×H200 node and the multi-node launcher does not
+exist), DeepSeek-V4-Flash (149 GB, Gate-1 NO-GO), Qwen3-Coder-Next (149 GB),
+Qwen2.5-Coder-32B (62 GB), Qwen3-32B (62 GB), Qwen3-Coder-30B-A3B (57 GB). Configs,
+index files, and licenses for the two never-served checkpoints are preserved under
+`_scratch/tombstones/` with a re-staging recipe.
+
+**Consequences recorded, not papered over:**
+- `qwen3.8_27B` has **no `rate_table.json` row**, so coding sessions now bill the
+  reservation FLOOR with no token-metered component. `qwen2.5_coder_32B` held one of only
+  three honest rate rows. A `bench_billing.py` run on the cu129 env is owed and is now
+  the highest-priority open item.
+- The frozen benchmark baseline's weights are gone. The 26.67% anchor survives only as
+  `benchmark/frozen_baseline/stage2_score_bench-coder32b.json`, which
+  `score_stage2.sbatch` still reuses for adjudication — but it can never be regenerated
+  or re-run under a new condition. Benchmark evidence was moved out of gitignored
+  `_scratch/` into tracked `benchmark/frozen_baseline/` before any weights were deleted.
+- `tools/stage2_score.py:26` still reads `BASELINE_KEY = "qwen2.5_coder_32B"` and was
+  deliberately NOT edited: `prereg-check` verifies harness constants against the frozen
+  `prereg.md`, and editing it in place is exactly the post-hoc change that gate exists to
+  catch. Promoting 50.00% to the baseline needs a NEW pre-registration for the next round.
+- 50.00% was measured with thinking OFF, which is **not** this model's default mode
+  (`reasoning_effort: xhigh`). The figure is a lower bound; a thinking-on run is unrun.
+- `qwen2.5_coder_32B` was the only model an external user (ndtrung) had ever run.
+
+Docs updated across 15 pages, including inverting the tool-calling guidance that told
+users to avoid the coding model for agent work. `mkdocs build --strict` passes.
+
+### Stage 3 (service wiring, Gate 3) — Tier-B winner wired branch-local; production cutover deferred to operator (2026-08-05)
+
+Wires the measured Tier-B result into the service on the branch and hands the one step the
+loop must not self-trigger to the operator. No production default is flipped.
+
+- **Registry / TP reconciliation.** `server.py`'s `qwen3.5_122B` comment now records the
+  validated state (Gate-1 job 53069683: serves FP8 **TP=2** on 2×H200 under vLLM 0.26.0;
+  Gate-2 Tier-B coding winner) in place of the stale "not smoke-tested" note, and the TP
+  pin is corrected from 4 to the measured **2** in `bin/ai-session::tp_for_model` and the
+  inline `MODEL_REGISTRY` comment. FP8 fits TP=2 on 2×H200, so a staff smoke reserves two
+  GPUs, not four. No production-served model's config changes — only the not-yet-served
+  122B (`qwen2.5_72B` and `llama3.1_70B` stay at TP=4).
+- **Docs.** `docs/reference.md` no longer lists the 122B as "smoke test pending"; it is
+  validated on H200 and the measured Tier-B coding winner, with the production cutover
+  marked operator-pending (model table, prose, and capability-frame marker).
+- **Kept baseline at Tier A.** Per the Stage-2 NO-GO, `qwen2.5_coder_32B` remains the
+  Tier-A (A100) coding model; nothing is rewired there.
+- **Verdict.** `prompts/60_model_refresh/verdict.md` records the per-stage outcomes, the
+  honest measured numbers, and a compute-provenance table for every `mrefresh-nest*` job.
+
+**OPERATOR-DECISION-PENDING — production cutover of `qwen3.5_122B` (why the loop stops here).**
+Adding `qwen3.5_122B` to `PHASE1_SERVED` and giving it a billing `rate_table` row is
+deliberately NOT done — both would be unsafe or dishonest from inside the loop:
+  1. The production launcher (`launch_ai_session.sh`) hardcodes the 0.10.2 `vllm-probe`
+     serving env, where `Qwen3_5MoeForConditionalGeneration` does not load. Adding the key
+     to `PHASE1_SERVED` today would let a user reserve 2×H200, fail on load, and **floor-bill**
+     (the job name `qwen3.5_122B:port` is swept by `billing_sweep.py::model_key_of`). A safe
+     flip first requires routing production serving of this model to the `vllm-serve-cu129`
+     (0.26.0) env — a production-runtime change outside the loop's authority.
+  2. A `rate_table` row is the billing source of truth (prefill/decode throughput measured
+     by `bench_billing.py` on the serve env). The Stage-2 measurement is **pass@1** at
+     concurrency 1, not a throughput sweep, so it cannot fill a row — inventing one would be
+     a fabricated billing number (forbidden). A valid row needs a `bench_billing.py` run on
+     the 0.26.0 serve env (a rate re-benchmark), which the loop must not self-trigger.
+The operator runbook is in `prompts/60_model_refresh/verdict.md`. Until it is done, the
+branch leaves `PHASE1_SERVED` and `rate_table.json` untouched.
+
+### Tier A & B Stage 2 (raw code-gen, Gate 2) — measured 2026-08-05, frozen 60-problem LiveCodeBench subset
+
+Greedy pass@1 head-to-head against the incumbent `qwen2.5_coder_32B` (Qwen2.5-Coder-32B-Instruct,
+the model this refresh replaces). Every model — baseline and both candidates — served on
+`vllm-serve-cu129` (vLLM 0.26.0) under the identical frozen DECODE (`prereg.md` §3: greedy,
+`enable_thinking:false`, `max_tokens` 8192) and scored by the same harness on `caslake`;
+`prereg-check` PASS before every scoring run (subset SHA, decode, and the +3.0-pt margin were
+frozen and committed before the first score). Baseline measured 26.67% (16/60) on this subset.
+
+- **Tier B — Qwen3.5-122B-A10B-FP8: Gate-2 PASS, +18.33 pts (45.00% vs 26.67%).** 27/60 vs
+  16/60; by difficulty hard 7/30 vs 0/30, medium 10/18 vs 6/18, easy 10/12 vs 10/12 (tie).
+  Clears the +3.0 margin decisively and coherently — the 2026 122B pulls ahead across the
+  medium/hard tail where the late-2024 32B solves none of the 30 hard problems, and ties on
+  easy. Both runs complete (n_infra=0). Score job `mrefresh-nest-score` 53083189; generations
+  53080066 (122B, concurrency-1 resume that completed the arc195/arc196 tail) and 53057094
+  (baseline). **Gate-2 outcome: adopt Qwen3.5-122B as the Tier-B (H200) served coding model —
+  Stage 3 wires it (registry/rate-table/docs, TP reconciliation), gauntlet-gated.**
+- **Tier A — Qwen3-Coder-30B-A3B-Instruct: Gate-2 NO-GO, −1.67 pts (25.00% vs 26.67%).** 15/60
+  vs 16/60; hard 1/30 vs 0/30, medium 5/18 vs 6/18, easy 9/12 vs 10/12. The smaller
+  30.5B/3.3B-active MoE does not beat the 32B dense incumbent on raw code-gen, so the
+  pre-registered fail-branch applies (`session_start.md` §2): **keep the baseline
+  `qwen2.5_coder_32B` at Tier A.** A valid measured finding, not a blocker. Both runs complete
+  (n_infra=0). Score job 53088886; generations 53057093 + arc196_d resume 53083190
+  (resumed_kept=59), baseline 53057094.
+
+Honest caveat (disclosed in `prereg.md` §5/§9): n=60 greedy is a point estimate; a 3-pt gap is
+within binomial noise (SE ≈ 6 pts near p=0.4). Tier B's +18.33 is far outside that band; Tier A's
+−1.67 is comfortably a non-win. The window (2025-03/04) post-dates the baseline's training cutoff
+(fair to the baseline) and skews hard, so absolute pass rates are low for all models — but the
+COMPARISON is controlled by construction (same subset, decode, harness, and serve env/version).
+
+Hardware/quant asymmetry (Tier B only, architecturally forced — not in `prereg.md`, disclosed here):
+the Tier-B candidate is served on 2×H200 (FP8) because Qwen3.5-122B does not fit the A100/BF16 tier,
+while the single shared incumbent baseline was measured on A100 (BF16). So the Tier-B head-to-head
+compares each model on the hardware it would actually be served on (deployment-realistic), not on
+identical silicon; Tier A is fully hardware-matched (candidate and baseline both A100/BF16). This is
+implausible as the driver of the +18.33 result — the gap is 11 problems with the baseline solving
+0/30 hard (a capability gap), far beyond any cross-GPU/quant numerics effect, which shifts at most
+~1 greedy problem. An H200-served baseline was not separately measured (out of loop scope; an
+operator wanting silicon-matched Tier-B numbers can commission one).
+
+### Tier B Stage 1 (serves) — measured 2026-08-05, vLLM 0.26.0 (vllm-serve-cu129), H200 driver 535.216.03
+
+- **Qwen3.5-122B-A10B-FP8: Gate-1 PASS.** Serves on 2×H200 at TP=2 (FP8), 58.24 GiB
+  weight/GPU plus 62.89 GiB KV cache, engine init 76 s; a text-only code prompt returns
+  a clean compilable `two_sum` (HTTP 200, finish_reason=stop). Job mrefresh-nest-stage1
+  53069683, served-name `bench-qwen35-122b` (a benchmark-only name, not a MODEL_REGISTRY
+  key — no production discovery, no billing sweep). Measurement: FP8 needs only TP=2 on
+  2×H200, not the TP=4 the service currently pins (`bin/ai-session::tp_for_model`, the case
+  arm for `qwen3.5_122B`; `server.py`'s MODEL_REGISTRY entry only mirrors it in a comment);
+  Stage 3 reconciles. Raw-code-gen vs the baseline is the next gate.
+- **DeepSeek-V4-Flash: clean Gate-1 NO-GO on this cluster** (the pre-registered
+  fail-branch, `session_start.md` §2). With `--kv-cache-dtype fp8` (its fp8_ds_mla layout
+  requires it) the load clears arch and kv-cache and reaches expert quantization, where
+  the NVFP4 experts resolve to the Marlin MXFP4 MoE backend (Hopper has no FP4 tensor
+  cores) and the Marlin FP4 repack aborts with `cudaErrorUnsupportedPtxVersion`
+  (`marlin_utils_fp4.py::_repack_marlin_experts`): that kernel's PTX targets a newer CUDA
+  toolchain than driver 535 can load. Deterministic — not a §9 infra-retry. Tier B
+  proceeds on Qwen3.5-122B alone. Job 53069684; two H200 reservations spent (53061901
+  config gap, 53069684 definitive), no further retries. A speculative Hopper-viable path
+  remains — force the Triton MXFP4 MoE backend (`--kernel-config`) or upgrade the cluster
+  driver/CUDA toolkit — but it is unproven (may hit the same PTX wall, and V4's expert
+  config is untested there) and needs a harness change plus a GPU validation, so it cannot
+  overturn this NO-GO; recorded for a future operator decision.
+
+### Serve-env hardening (enabling the above)
+
+- `tools/serve_cu129.sbatch`: redirect all serve-time caches off the quota-limited home
+  fileset (vLLM cache to /project; XDG/Triton/Inductor/Torch/FlashInfer to node-local
+  $TMPDIR) after a full home crashed a 122B load with `[Errno 122] Disk quota exceeded`;
+  auto-add `--kv-cache-dtype fp8` for DeepSeek-V4* model dirs. Frozen DECODE unchanged;
+  billing-floor, production, and time-box fences intact (commits 0ced4b0, 67e432e).
+
 ## 2026-07-09 — consistency-audit fixes (four-way adversarial review)
 
 ### Correctness (Tier 1)

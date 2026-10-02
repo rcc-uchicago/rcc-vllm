@@ -46,9 +46,9 @@ usage() {
   cat <<'EOF'
 usage: ai-session <command> [options]
 
-Start a session (holds GPUs; billing runs until you stop it):
+Start a session (holds a node until you stop it):
   chat            general chat in your browser        (Qwen2.5 72B)
-  code            coding session for aider/opencode   (Qwen2.5 Coder 32B)
+  code            coding session for aider/opencode   (Qwen3.8 27B)
   fast            small, cheap chat session           (Qwen3 4B)
     options:  --account NAME    your Slurm account (required the first time;
                                 then remembered in ~/.ai-session/config)
@@ -62,6 +62,13 @@ Start a session (holds GPUs; billing runs until you stop it):
               --lora NAME=PATH  also serve your fine-tuned adapter (LoRA);
                                 repeatable. Requests that set model=NAME get
                                 the adapter; model=<base key> gets the base.
+              --cpu             run on a CPU-only partition instead of a GPU:
+                                serves the small Qwen2.5 0.5B model only and
+                                holds no GPU; `stop` reports the tokens the job
+                                consumed. Use it to try the browser
+                                chat or wire up opencode/aider. Give the CPU
+                                partition with --partition (e.g. amd, caslake);
+                                it is remembered separately from your GPU one.
 
 Use / inspect the running session:
   status          is the session ready, still loading, or stopped?
@@ -69,16 +76,18 @@ Use / inspect the running session:
   env             print `export AISESSION_BASE_URL/... ` lines; use as
                       eval "$(ai-session env)"
   models          list the model presets
-  receipt         re-print the newest billing receipt (or: receipt <file>)
+  receipt         re-print the newest usage receipt: tokens consumed (or: receipt <file>)
+  claude          run Claude Code against the running session's model
+                  (needs Claude Code installed; extra arguments go to claude)
   mcp config      print the config block that gives a coding agent the two
                   built-in tool servers (job queue, usage) -- see the docs
   mcp run NAME    run one of the tool servers (agents call this; not for
                   interactive use). NAME is jobs or usage.
 
 Finish:
-  stop            stop the session, free the GPUs, print the usage charge
+  stop            stop the session, free the node, print the tokens consumed
 
-A session keeps costing while it is up, busy or idle -- run `ai-session stop`
+A session holds its node while it is up, busy or idle -- run `ai-session stop`
 as soon as you are done.
 EOF
 }
@@ -88,8 +97,10 @@ EOF
 # can still export MODEL/TP/CONSTRAINT directly to bypass this.
 tp_for_model() {
   case "$1" in
-    qwen2.5_72B|llama3.1_70B|qwen3.5_122B) echo 4 ;;
-    qwen2.5_coder_32B|qwen3_32B)           echo 2 ;;
+    qwen2.5_72B|llama3.1_70B)              echo 4 ;;
+    qwen3.5_122B)                          echo 2 ;;  # FP8 MoE fits TP=2 on 2xH200 (measured, job 53069683)
+    qwen3.8_27B)                           echo 2 ;;  # 27.8B BF16 (~51.8GiB) fits TP=2 on 2xH100 (measured, jobs 53533204/53534097)
+    gemma4_31B)                            echo 2 ;;  # 30.7B BF16 (58.25GiB) = 30.38GiB/GPU at TP=2; fits every tier (measured 53544338/53544339/53586877/53586878)
     qwen3_4b|qwen2.5_0.5B)                 echo 1 ;;
     *) echo "" ;;
   esac
@@ -100,8 +111,42 @@ tp_for_model() {
 # preset's A100 default.
 constraint_for_model() {
   case "$1" in
-    qwen3.5_122B) echo H200 ;;
-    glm5.2_753B) echo H200 ;;
+    # qwen3.5_122B is native FP8, so it REQUIRES Hopper -- A100 (Ampere) has no FP8
+    # tensor cores and would fail on load and floor-bill. It must never fall through
+    # to the preset's A100 default. Accept either Hopper tier so users with H100 or
+    # H200 access can serve it; this project's own no-H200 rule (CLAUDE.md) is our
+    # scheduling etiquette, not a property of the service.
+    # MEASURED on BOTH Hopper tiers at TP=2, 58.24 GiB weights/GPU:
+    #   2xH200            job 53069683 -- 62.89 GiB KV
+    #   2xH100 NVL (93.6GiB) job 53538328 -- 20.85 GiB KV = 1,016,978 tokens, accept PASS
+    # TP=2 is therefore correct on either tier; no TP=4 fallback is needed.
+    qwen3.5_122B) echo "H100|H200" ;;
+    # BF16, so no Hopper requirement. Pinned to A100 as of 2026-08-19: H100 exists ONLY
+    # in PI-owned partitions and `test`, so an H100 pin made the default coding model
+    # unstartable for any user who is not RCC staff or in one of those groups. A100 is
+    # reachable via beagle3 (22 nodes) and the open `gpu` partition, and its tier weight
+    # is 1.0 vs H100's 2.0, halving the reservation floor.
+    # MEASURED at TP=2, 25.69 GiB weights/GPU:
+    #   2xA100 80GB  job 53540552 -- 44.05 GiB KV = 1,117,146 tokens, accept PASS
+    #   2xH100 NVL   jobs 53533204/53534097 -- also fine, kept as an override
+    # Both feature spellings are accepted: uppercase A100 = midway3 80GB (measured),
+    # lowercase a100 = beagle3/gpu 40GB. At TP=2 the 40GB card holds 25.69 GiB of weights
+    # with ~10 GiB left for KV -- sound arithmetic, verification in flight (53542132/33).
+    # NOTE: the rate_table row for this model is still h100-only, so an A100 session
+    # bills the reservation floor until an a100 row is measured. That floor (2.0 SU/h)
+    # is still HALF the H100 floor, so this is a net saving for users either way.
+    qwen3.8_27B) echo "A100|a100" ;;
+    # gemma4_31B: lowercase features ONLY, on purpose. Uppercase A100 is midway3's 80GB
+    # cards, which sit in PI-owned partitions (gagalli-gpu, schmidt-gpu) -- CLAUDE.md says
+    # do not target those by default. Lowercase a100/a40 are beagle3 consortium hardware,
+    # owned by nobody, 22 nodes each, and reachable by ordinary users.
+    # MEASURED KV headroom at TP=2 (30.38 GiB weights/GPU):
+    #   a40  (46 GiB)  9.17 GiB KV = 51,325 tokens, 3.13x concurrency @16K  -- tier weight 0.5
+    #   a100 (40 GiB)  4.71 GiB KV = 26,342 tokens, 1.61x concurrency @16K  -- tier weight 1.0
+    # Note the inversion: A40 is BOTH cheaper and roomier for this model, because Gemma is
+    # heavy (58.25 GiB) and the A40 card is larger than a 40GB A100. Users with H100/A100-80GB
+    # access can still override with CONSTRAINT=H100 etc.
+    gemma4_31B) echo "a40|a100" ;;
     *) echo "" ;;
   esac
 }
@@ -113,9 +158,24 @@ constraint_for_model() {
 write_env_file() {
   local key="" model=""
   [ -f "$KEYFILE" ] && key=$(cat "$KEYFILE" 2>/dev/null || true)
+  local device="gpu" occfg
   if [ -f "$UPSTREAM" ]; then
     model=$("$PY" -c "import json;print(json.load(open('$UPSTREAM')).get('model_key') or '')" 2>/dev/null || true)
+    # CPU or GPU: recorded in the running session's file (logs/sessions/<user>_<jobid>.json).
+    device=$("$PY" - "$UPSTREAM" "$AISESSION_STATE_DIR" "$U" <<'PYEOF' 2>/dev/null || echo gpu
+import json, os, sys
+up, state, user = sys.argv[1:4]
+jobid = json.load(open(up)).get("jobid")
+sess = os.path.join(state, "logs", "sessions", f"{user}_{jobid}.json")
+print(json.load(open(sess)).get("device") or "gpu" if jobid and os.path.isfile(sess) else "gpu")
+PYEOF
+)
   fi
+  # A CPU session gets opencode with its tools turned off: the tool definitions are
+  # most of opencode's ~15,000-token prompt, which takes minutes to read on CPU, and
+  # the 0.5B CPU model cannot use the tools reliably anyway.
+  occfg="$AS/opencode.ai-session.json"
+  [ "$device" = "cpu" ] && occfg="$AS/opencode.ai-session-cpu.json"
   mkdir -p "$HOME/.ai-session"; chmod 700 "$HOME/.ai-session"
   ( umask 077; cat > "$ENVFILE" <<EOF
 # ai-session client settings -- written by \`ai-session\`, read by clients.
@@ -123,6 +183,19 @@ write_env_file() {
 export AISESSION_BASE_URL="http://localhost:$GW_PORT/v1"
 export AISESSION_API_KEY="$key"
 export AISESSION_MODEL="$model"
+export AISESSION_DEVICE="$device"
+# opencode: an inline config that reads the three values above, so no opencode.json
+# is needed. Inline (OPENCODE_CONFIG_CONTENT) takes precedence over a project-local
+# opencode.json that pins some other model; OPENCODE_CONFIG would lose to it.
+export OPENCODE_CONFIG_CONTENT="\$(cat '$occfg')"
+# aider: it reads every option from OPENAI_* / AIDER_* variables, so plain \`aider\` works.
+export OPENAI_API_BASE="http://localhost:$GW_PORT/v1"
+export OPENAI_API_KEY="$key"
+export AIDER_MODEL="openai/$model"
+export AIDER_WEAK_MODEL="openai/$model"
+export AIDER_MODEL_METADATA_FILE="$AS/aider_model_metadata.json"
+export AIDER_EDIT_FORMAT="diff"
+export AIDER_ANALYTICS_DISABLE="true"
 EOF
   )
   chmod 600 "$ENVFILE"
@@ -134,8 +207,8 @@ print_env() {
 }
 
 # --- start verbs ----------------------------------------------------------------
-parse_start_opts() {   # sets OPT_TIME OPT_MODEL OPT_AGENT OPT_LORA OPT_ACCOUNT OPT_PARTITION
-  OPT_TIME="" OPT_MODEL="" OPT_AGENT=0 OPT_LORA="" OPT_ACCOUNT="" OPT_PARTITION=""
+parse_start_opts() {   # sets OPT_TIME OPT_MODEL OPT_AGENT OPT_LORA OPT_ACCOUNT OPT_PARTITION OPT_CPU
+  OPT_TIME="" OPT_MODEL="" OPT_AGENT=0 OPT_LORA="" OPT_ACCOUNT="" OPT_PARTITION="" OPT_CPU=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --time)      OPT_TIME=$2; shift 2 ;;
@@ -144,9 +217,15 @@ parse_start_opts() {   # sets OPT_TIME OPT_MODEL OPT_AGENT OPT_LORA OPT_ACCOUNT 
       --lora)      OPT_LORA="${OPT_LORA:+$OPT_LORA }$2"; shift 2 ;;
       --account)   OPT_ACCOUNT=$2; shift 2 ;;
       --partition) OPT_PARTITION=$2; shift 2 ;;
+      --cpu)       OPT_CPU=1; shift ;;
       *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
   done
+  # Refuse a bad --cpu combination before anything is remembered or submitted.
+  if [ "$OPT_CPU" = "1" ] && [ -n "$OPT_MODEL" ] && [ "$OPT_MODEL" != "$CPU_MODEL" ]; then
+    echo "ERROR: --cpu serves only $CPU_MODEL (Qwen2.5 0.5B Instruct); '$OPT_MODEL' needs a GPU session." >&2
+    exit 2
+  fi
 }
 
 # Slurm account + GPU partition are unique to each user/PI, so there is no safe
@@ -162,11 +241,25 @@ config_get() {  # config_get KEY -> value from CONFIG_FILE (last wins), or empty
   sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -1
 }
 
+config_set() {  # config_set KEY VALUE -- update one key, keep the others
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  ( umask 077
+    { [ -f "$CONFIG_FILE" ] && grep -v "^$1=" "$CONFIG_FILE" || true; printf '%s=%s\n' "$1" "$2"; } \
+      > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE" )
+}
+
 resolve_account_partition() {
-  local acct part cfg_a cfg_p
-  cfg_a=$(config_get ACCOUNT); cfg_p=$(config_get PARTITION)
+  local acct part cfg_a cfg_p pkey=PARTITION
+  # --cpu sessions run on a CPU partition, remembered under its own key so the
+  # GPU partition used by ordinary sessions is left alone.
+  [ "${OPT_CPU:-0}" = "1" ] && pkey=CPU_PARTITION
+  cfg_a=$(config_get ACCOUNT); cfg_p=$(config_get "$pkey")
   acct=${OPT_ACCOUNT:-${ACCOUNT:-$cfg_a}}
-  part=${OPT_PARTITION:-${PARTITION:-$cfg_p}}
+  if [ "$pkey" = "CPU_PARTITION" ]; then
+    part=${OPT_PARTITION:-${CPU_PARTITION:-$cfg_p}}
+  else
+    part=${OPT_PARTITION:-${PARTITION:-$cfg_p}}
+  fi
   if [ -z "$acct" ] || [ -z "$part" ]; then
     cat >&2 <<EOF
 ERROR: this service needs YOUR Slurm account and GPU partition. They are unique
@@ -174,6 +267,8 @@ to you and your PI, so there is no default. Set them once (they are remembered
 in $CONFIG_FILE for next time):
 
   ai-session ${VERB:-chat} --account <your-account> --partition <your-partition>
+
+(With --cpu, give a CPU-only partition such as amd or caslake.)
 
 To find them, ask your PI or RCC which account and GPU partition to use, or list
 the accounts you belong to:
@@ -185,9 +280,9 @@ EOF
   export ACCOUNT="$acct" PARTITION="$part"
   # Remember values supplied explicitly on the command line.
   if [ -n "$OPT_ACCOUNT" ] || [ -n "$OPT_PARTITION" ]; then
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    ( umask 077; printf 'ACCOUNT=%s\nPARTITION=%s\n' "$acct" "$part" > "$CONFIG_FILE" )
-    echo "==> remembered account=$acct partition=$part in $CONFIG_FILE"
+    config_set ACCOUNT "$acct"
+    config_set "$pkey" "$part"
+    echo "==> remembered account=$acct $(echo "$pkey" | tr 'A-Z_' 'a-z ')=$part in $CONFIG_FILE"
   fi
 }
 
@@ -204,6 +299,24 @@ apply_model_opt() {    # export MODEL/TP when --model was given
   fi
   [ -n "$OPT_TIME" ] && export TIME="$OPT_TIME"
   return 0
+}
+
+CPU_MODEL=qwen2.5_0.5B   # the only model --cpu serves (server.CPU_SERVED)
+
+apply_cpu_opt() {      # --cpu: serve CPU_MODEL on a CPU-only node, no GPU
+  [ "$OPT_CPU" = "1" ] || return 0
+  if [ -n "$OPT_MODEL" ] && [ "$OPT_MODEL" != "$CPU_MODEL" ]; then
+    echo "ERROR: --cpu serves only $CPU_MODEL (Qwen2.5 0.5B Instruct); '$OPT_MODEL' needs a GPU session." >&2
+    exit 2
+  fi
+  if [ -n "$OPT_LORA" ]; then
+    echo "ERROR: --lora is not supported with --cpu." >&2
+    exit 2
+  fi
+  # 16 cores / 32G is ample for a 0.5B model; 4 GiB of host RAM for the KV cache.
+  export MODEL="$CPU_MODEL" TP=1 CONSTRAINT=cpu AISESSION_CPU=1
+  export CPUS=${CPUS:-16} MEM=${MEM:-32G} CPU_KVCACHE_GIB=${CPU_KVCACHE_GIB:-4}
+  echo "==> CPU session: $CPU_MODEL on partition $PARTITION (no GPU; usage reported as tokens)"
 }
 
 apply_lora_opt() {     # validate --lora NAME=PATH pairs, export the LoRA env
@@ -253,6 +366,7 @@ PYEOF
 
 do_chat() {
   VERB=chat; parse_start_opts "$@"
+  export AISESSION_KIND=chat   # start-up banner wording (ai_session.py)
   resolve_account_partition
   # --agent works on chat/fast too: the browser tools (paper search) can then be
   # called by the model itself, not only via the UI's own orchestration. The
@@ -260,6 +374,7 @@ do_chat() {
   [ "$OPT_AGENT" = "1" ] && export AGENT_CLIENT=1
   export MODEL=${MODEL:-qwen2.5_72B} TP=${TP:-4} CONSTRAINT=${CONSTRAINT:-A100}
   apply_model_opt
+  apply_cpu_opt
   apply_lora_opt
   bash "$AS/run_browser_demo.sh" up
   write_env_file
@@ -268,10 +383,12 @@ do_chat() {
 
 do_fast() {
   VERB=fast; parse_start_opts "$@"
+  export AISESSION_KIND=chat
   resolve_account_partition
   [ "$OPT_AGENT" = "1" ] && export AGENT_CLIENT=1   # same as do_chat
   export MODEL=${MODEL:-qwen3_4b} TP=${TP:-1} CONSTRAINT=${CONSTRAINT:-A100}
   apply_model_opt
+  apply_cpu_opt
   apply_lora_opt
   bash "$AS/run_browser_demo.sh" up
   write_env_file
@@ -280,33 +397,115 @@ do_fast() {
 
 do_code() {
   VERB=code; parse_start_opts "$@"
+  export AISESSION_KIND=code
   resolve_account_partition
   [ "$OPT_AGENT" = "1" ] && export AGENT_CLIENT=1
   # mirror run_coding_agent.sh's defaults so the LoRA base-model check sees them
-  export MODEL=${MODEL:-qwen2.5_coder_32B} TP=${TP:-2} CONSTRAINT=${CONSTRAINT:-A100}
+  export MODEL=${MODEL:-qwen3.8_27B} TP=${TP:-2} CONSTRAINT=${CONSTRAINT:-A100}
   apply_model_opt
+  apply_cpu_opt
   apply_lora_opt
   bash "$AS/run_coding_agent.sh" up
   write_env_file
   post_up_note
 }
 
+# --- Claude Code against the session --------------------------------------------
+# vLLM serves the Anthropic Messages API (/v1/messages) and the gateway proxies it,
+# so Claude Code works with ANTHROPIC_BASE_URL pointed at the gateway. Everything is
+# scoped to THIS run (env on the exec line, settings via --settings, its own config
+# dir), so a later plain `claude` still talks to Anthropic with your own login.
+do_claude() {
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "Claude Code is not installed (no 'claude' on PATH). Install it first:" >&2
+    echo "  curl -fsSL https://claude.ai/install.sh | bash" >&2
+    exit 1
+  fi
+  write_env_file
+  # shellcheck disable=SC1090
+  . "$ENVFILE"
+  if [ -z "${AISESSION_MODEL:-}" ] || [ -z "${AISESSION_API_KEY:-}" ]; then
+    echo "No ai-session is running. Start one first (e.g. ai-session code --agent), then" >&2
+    echo "run 'ai-session claude' again. 'ai-session status' shows whether it is ready." >&2
+    exit 1
+  fi
+  # modelPicker: show the session model under its own name and map it to a known
+  # model class (behavesAs) -- this also stops Claude Code's "isn't described by this
+  # version's model catalog" warning.
+  local settings
+  settings=$(printf '{"modelPicker":{"options":[{"model":"%s","label":"%s (ai-session)","behavesAs":"claude-haiku-4-5"}],"replaceBuiltInOptions":true}}' \
+             "$AISESSION_MODEL" "$AISESSION_MODEL")
+  local extra=()
+  # CPU session: no tools. Claude Code's tool definitions are 15-24K tokens per
+  # request (minutes to read on CPU), and the small CPU model cannot use them.
+  [ "${AISESSION_DEVICE:-gpu}" = "cpu" ] && extra=(--tools "")
+  mkdir -p "$HOME/.ai-session/claude"
+  exec env -u ANTHROPIC_API_KEY \
+    CLAUDE_CONFIG_DIR="$HOME/.ai-session/claude" \
+    ANTHROPIC_BASE_URL="http://localhost:$GW_PORT" \
+    ANTHROPIC_AUTH_TOKEN="$AISESSION_API_KEY" \
+    ANTHROPIC_MODEL="$AISESSION_MODEL" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="$AISESSION_MODEL" \
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    claude --settings "$settings" "${extra[@]}" "$@"
+}
+
 post_up_note() {
-  cat <<EOF
-
-Client settings were saved to $ENVFILE. In any shell, load them with:
-
-  eval "\$(ai-session env)"
-
-then clients can use \$AISESSION_BASE_URL, \$AISESSION_API_KEY and
-\$AISESSION_MODEL directly. \`ai-session connect\` re-prints the full
-per-client setup at any time; \`ai-session stop\` ends the session.
-EOF
+  echo
+  echo "\`ai-session connect\` shows these settings again; \`ai-session stop\` ends the session."
 }
 
 # --- status ---------------------------------------------------------------------
+# Bring-up progress written by ai_session.py (while the model loads) and by the
+# wrappers (once the gateway / web page is up). This is the "is it ready yet?" flag:
+# the gateway itself only starts AFTER the model has loaded, so during loading it
+# cannot answer.
+PROGRESS_FILE="$RUN_DIR/progress.json"
+
+progress_status() {   # prints a status block and returns 0 if a bring-up is recorded
+  [ -f "$PROGRESS_FILE" ] || return 1
+  "$PY" - "$PROGRESS_FILE" <<'PYEOF'
+import json, subprocess, sys, time
+try:
+    p = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+state, msg = p.get("state"), p.get("message", "")
+jobid = p.get("jobid")
+if jobid and state in ("queued", "loading", "model_ready"):
+    alive = subprocess.run(["squeue", "-h", "-j", str(jobid)], capture_output=True, text=True).stdout.strip()
+    if not alive:
+        sys.exit(1)   # stale: the job is gone; fall through to the gateway check
+since = p.get("since")
+elapsed = f" ({int(time.time() - since) // 60}:{int(time.time() - since) % 60:02d} elapsed)" if since else ""
+if state == "ready":
+    print("session: READY -- open the tunnel now.")
+    if p.get("kind") == "chat":
+        port, login, user = p.get("owui_port"), p.get("login"), p.get("user")
+        print(f"  on your laptop:  ssh -N -f -L {port}:localhost:{port} {user}@{login}.rcc.uchicago.edu")
+        print(f"  then browse:     http://localhost:{port}")
+    else:
+        print("  client settings: ai-session connect")
+elif state == "failed":
+    print(f"session: FAILED -- {msg}.")
+    if p.get("server_log"):
+        print(f"  log: {p['server_log']}")
+else:
+    print(f"session: STARTING -- {msg}{elapsed}.")
+    print("  NOT ready yet: do not open the tunnel. Run `ai-session status` again in a minute.")
+PYEOF
+}
+
 do_status() {
   local st model
+  # 0) a recorded bring-up (loading / ready / failed) answers first
+  if progress_status; then
+    if [ -f "$KEYFILE" ]; then
+      echo "access key: set ($(cut -c1-6 "$KEYFILE")...; full value: ai-session connect)"
+    fi
+    return 0
+  fi
   # 1) the gateway's own answer (ready / loading / stopped)
   if st=$(curl -sf --max-time 6 "http://127.0.0.1:$GW_PORT/status" 2>/dev/null); then
     local state; state=$("$PY" -c "import json,sys;print(json.loads(sys.argv[1]).get('backend_state','?'))" "$st")
@@ -405,15 +604,20 @@ case "$CMD" in
   stop|down) do_stop ;;
   connect)  write_env_file; "$PY" "$AS/ai_session.py" connect --gateway-port "$GW_PORT" "$@" ;;
   env)      print_env ;;
+  claude)   do_claude "$@" ;;
   receipt)  if [ $# -gt 0 ]; then "$PY" "$AS/print_su_receipt.py" "$@"
             else "$PY" "$AS/print_su_receipt.py" --usage-dir "$AISESSION_STATE_DIR/logs/usage"; fi ;;
   mcp)      do_mcp "$@" ;;
   models)   cat <<'EOF'
 preset  command            model                    what it is for
 chat    ai-session chat    Qwen2.5 72B Instruct     general questions, writing, analysis
-code    ai-session code    Qwen2.5 Coder 32B        coding with aider/opencode/Continue
+                                                    (also the web GUI / Open WebUI model)
+code    ai-session code    Qwen3.8 27B              coding with aider/opencode/Continue
 fast    ai-session fast    Qwen3 4B                 quick answers at the lowest cost
+cpu     ai-session chat --cpu  Qwen2.5 0.5B Instruct  no GPU: try the browser chat
+        ai-session code --cpu                         or wire up opencode/aider (CPU node)
 Any preset accepts --model KEY to serve a different registered model.
+--cpu serves only qwen2.5_0.5B.
 EOF
   ;;
   help|-h|--help) usage ;;

@@ -54,6 +54,7 @@ nav:
       - aider: coding/aider.md
       - Continue: coding/continue.md
       - opencode and Cline: coding/opencode.md
+      - Claude Code: coding/claude-code.md
       - MCP Servers: coding/mcp.md
       - Agent responsibilities and risks: coding/agents.md
   - Billing and Service Units: billing.md

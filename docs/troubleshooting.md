@@ -5,29 +5,31 @@ fixes. Each section below is named after the error message or symptom you will
 actually see, so searching this site for the error text lands here. Launch and
 configuration instructions live on the client pages
 ([aider](coding/aider.md), [Continue](coding/continue.md),
-[opencode and Cline](coding/opencode.md), [browser chat](getting-started.md));
+[opencode and Cline](coding/opencode.md), [Claude Code](coding/claude-code.md),
+[browser chat](getting-started.md));
 this page assumes you followed one of them and something did not work.
 
 ## First checks
 
-Before reading any symptom section, run this three-step diagnostic sequence. None
-of these commands costs Service Units (SU): only the running GPU session bills,
-and these commands only inspect it. Run all three **on the login node** where you
+Before reading any symptom section, run this three-step diagnostic sequence. These
+commands only inspect the session; they hold no GPU and change nothing. Run all three **on the login node** where you
 started the session.
 
 | Step | Description | Command |
 |---|---|---|
-| 1 | Is the session ready, still loading, or stopped? | `ai-session status` |
+| 1 | Is the session starting, ready, failed, or stopped? | `ai-session status` |
 | 2 | Confirm the gateway process is alive and knows its backend | `curl -sf http://127.0.0.1:<GW_PORT>/__gateway/health` |
 | 3 | Confirm the model server answers through the session URL | `eval "$(ai-session env)" && curl -s "$AISESSION_BASE_URL/models" -H "Authorization: Bearer $AISESSION_API_KEY"` |
 
 - Replace `<GW_PORT>` with your port. The per-user default is
   `8400 + UID % 90`; print yours with `echo $((8400 + $(id -u) % 90))`.
 
-Step 1 answers the usual question directly: `READY` (with the model and URL),
-`STARTING` (the model is still loading — wait and re-check), or none running. It
-also shows whether an access key is set and how long a running session has been
-up.
+Step 1 answers the usual question directly. It prints `session: READY -- open the
+tunnel now.` (with the tunnel command for a chat session, or `client settings:
+ai-session connect` for a coding session); `session: STARTING -- <stage> (m:ss
+elapsed).` followed by `NOT ready yet: do not open the tunnel.`; `session: FAILED
+-- <reason>.` with the path of the server log; or that no session is running. It
+also shows whether an access key is set.
 
 Step 2 checks the gateway — the small always-on connection point the service
 runs on the login node. It gives clients one stable web address while the GPU
@@ -65,14 +67,17 @@ Unknown context window size
 
 **Cause.** litellm was not given the metadata file that declares the served
 model's context window (32768 tokens) and zero per-token cost, so it cannot size
-prompts.
+prompts. The `aider` provided by `module load ai-session` sets this file itself
+(through `AIDER_MODEL_METADATA_FILE`) on every start, so the warning means a
+different aider ran: your own install, earlier on your `PATH`, started without the
+session's settings.
 
-**Check.** Inspect the aider command you ran: it must include
-`--model-metadata-file`.
+**Check.** `which aider` should print the path inside the ai-session module.
 
-**Fix.** Copy the aider command printed by `ai-session code` verbatim rather than
-retyping it — it already includes the flag. The full command and an explanation
-of each flag are on the [aider page](coding/aider.md).
+**Fix.** Run `module load ai-session` and then plain `aider`. To use your own aider
+install, run `eval "$(ai-session env)"` in that shell first; it exports the
+`AIDER_*` settings, including the metadata file. Details are on the
+[aider page](coding/aider.md).
 
 ## Prompt reported as too long
 
@@ -100,12 +105,11 @@ the model emitting a well-formed diff for that particular file.
 
 **Fix.** First simply retry the request. If the same file fails repeatedly,
 switch aider to whole-file rewrites — this is a client-side flag, so you do not
-need to restart the GPU session. Exit aider and re-run the printed aider command
-with `--edit-format whole` in place of `--edit-format diff`. To make whole-file
-edits the default for a future session, start it with:
+need to restart the GPU session. Exit aider and start it again with the flag,
+which overrides the session's default of `diff`:
 
 ```bash
-EDIT_FORMAT=whole ai-session code
+aider --edit-format whole
 ```
 
 ## Tool calls fail silently in opencode or Cline
@@ -133,6 +137,89 @@ If tool calls still misbehave with `--agent` set and no workaround file present,
 [aider](coding/aider.md), which performs the same edits through chat completions
 and text diffs without function calling, against the same endpoint.
 
+## aider says no LLM model was specified, or asks about OpenRouter
+
+**Symptom.** Running `aider` prints a message that no model is set, offers to log in
+to OpenRouter, or prints:
+
+```
+No ai-session is running, so aider has no model to talk to. Start one first:
+```
+
+**Cause.** Either no session is running (or it is still starting), so there is no
+model and access key to load, or an older or separate aider ran that does not load
+the session's settings.
+
+**Check.** `ai-session status` **on the login node**, and `which aider`.
+
+**Fix.** If no session is running, start one with `ai-session code` (or
+`ai-session code --cpu` to try things out) and wait for the READY box; then run
+`aider` again. If a session is READY, run `module load ai-session` so that its
+`aider` comes first on your `PATH`, or run `eval "$(ai-session env)"` before your
+own aider. Decline the OpenRouter offer; it is not needed.
+
+## opencode uses the wrong model
+
+**Symptom.** opencode shows a model other than the session's (for example one
+pinned by a repository's own `opencode.json`), or its requests are refused.
+
+**Cause.** opencode read its settings from somewhere other than the running
+session: a repository `opencode.json`, or `OPENCODE_CONFIG_CONTENT` left over from
+an earlier session in that shell. `eval "$(ai-session env)"` sets an inline
+configuration that takes precedence over a repository `opencode.json`, but only in
+the shell where it was run and only for the session that was up at the time.
+
+**Fix.** In the shell where you run opencode, re-run the eval after the session is
+READY, then start opencode again:
+
+```bash
+eval "$(ai-session env)"
+opencode
+```
+
+opencode then shows the model by its key (for example `qwen3.8_27B`). Re-run the
+eval after every new session, since each session has a new access key.
+
+## Claude Code says `Not logged in`
+
+**Symptom.** `ai-session claude` starts, but Claude Code reports `Not logged in`,
+or its requests fail with an authentication error.
+
+**Cause.** The session it was pointed at has stopped or been restarted, so the
+access key it was given is no longer valid; or no session was running and the key
+is missing. `ai-session claude` passes the key of the session that was running when
+you launched it, and `ai-session stop` deletes that key.
+
+**Check.** `ai-session status` **on the login node**: it should report `READY` and
+`access key: set`.
+
+**Fix.** Exit Claude Code, wait for the session to be READY (start one with
+`ai-session code --agent` if none is running), and run `ai-session claude` again.
+Do not run `/login` inside this Claude Code: `ai-session claude` uses its own
+configuration directory (`~/.ai-session/claude`) and the session key, not your
+Anthropic login. See [Claude Code](coding/claude-code.md).
+
+## opencode or Claude Code is slow on a `--cpu` session
+
+**Symptom.** On a `--cpu` session, opencode or Claude Code takes tens of seconds to
+minutes per reply, or the model does not use tools.
+
+**Cause.** The time goes into reading the prompt. A CPU node reads prompt tokens
+slowly, and these clients send large prompts, mostly tool definitions. On a CPU
+session both run with their tools turned off for this reason. Measured on `amd`
+(16 cores): opencode's prompt drops from 15,122 to 2,006 tokens and a reply from
+about 2.5 minutes to 4 seconds; Claude Code's prompt drops from 15,000 to 24,000
+tokens to 5,859, and a reply from 229 to 32 seconds. The 0.5B model served on CPU
+cannot use tools reliably in any case.
+
+**Fix.** Use the CPU session only to try the service and check client wiring. For
+real coding work, start a GPU session:
+
+```bash
+ai-session stop
+ai-session code --agent
+```
+
 ## `model '...' is not fully staged`
 
 **Symptom.** The start command exits immediately with:
@@ -154,9 +241,8 @@ again, or start a model that is already staged, for example:
 ai-session code --model qwen2.5_72B
 ```
 
-!!! warning "The 72B reserves four GPUs and bills a higher floor than the coding default"
-    See the rate table on [Billing and Service Units](billing.md); stop with
-    `ai-session stop` when finished.
+!!! warning "The 72B reserves four GPUs, twice the coding default"
+    Stop it with `ai-session stop` when finished.
 
 ## Port already in use at start
 
@@ -194,6 +280,25 @@ GW_PORT=8490 ai-session code
     `status`, `connect`, and `stop` read `GW_PORT` too. If you overrode it at
     start, prefix them with the same `GW_PORT=8490` or they will inspect the
     wrong port.
+
+## I opened the tunnel and the page does not load
+
+**Symptom.** The browser shows a connection error or an empty page at
+`http://localhost:<UI_PORT>`, or a laptop client cannot connect, shortly after you
+started the session.
+
+**Cause.** The tunnel was opened before the session was ready. Until the READY box
+appears, nothing is listening on the UI port (Open WebUI starts only after the
+model has loaded), so the tunnel has nothing to forward to.
+
+**Check.** `ai-session status` **on the login node**. `STARTING` means it is not
+ready yet.
+
+**Fix.** Wait until `ai-session status` reports `session: READY -- open the tunnel
+now.` (or the READY box appears in the starting terminal), then reload the page.
+A tunnel opened earlier usually works once the session is ready; if not, kill it
+(`pkill -f "ssh -N -f -L <UI_PORT>"`) and run the tunnel command again. If the
+session is READY and the page still does not load, see the next section.
 
 ## The client on your laptop cannot connect
 
@@ -244,7 +349,7 @@ fails.
 **Cause.** The gateway runs as a background process on the login node, started
 from the terminal where you started the session. When the SSH connection hosting it
 closed (laptop sleep, network drop), it died with that connection. The GPU session
-may still be running — and still billing.
+may still be running, and still holding its GPUs.
 
 **Check.** `ai-session status` **on the login node**. A server still listed
 under `server:` means the GPU session survived the gateway.
@@ -252,24 +357,27 @@ under `server:` means the GPU session survived the gateway.
 **Fix.** Tear down cleanly, then start again, this time inside `tmux` or
 `screen` so an SSH drop cannot kill the gateway. `ai-session stop` is safe to run
 even when parts of the stack are already gone: it meters and ends any remaining
-session, stops any remaining gateway, and prints the SU charge.
+session, stops any remaining gateway, and prints the tokens consumed.
 
 ```bash
 ai-session stop
 ai-session code
 ```
 
-## Start seems stuck or the model takes minutes to appear
+## The terminal seems stuck after `submitted jobid`
 
-**Symptom.** The start command prints that it is starting the session, then
-appears to hang.
+**Symptom.** The start command prints `[start] submitted <model> jobid=<id>
+port=<port>`, then a "vLLM is starting -- PLEASE WAIT" banner, and appears to hang.
 
-**Cause.** This is usually normal. The command blocks until the model has loaded
-and answered a probe; loading a coding model typically takes several
-minutes after the GPUs are assigned. It waits up to 900 seconds by default
-(override with the `READY_TIMEOUT` environment variable, in seconds). The other
-common case is that the session has not been assigned GPUs yet because the
-cluster is busy.
+**Cause.** This is normal: the model is loading. The command blocks until the
+model has loaded and answered a probe, and prints a progress line with the elapsed
+time whenever the stage changes (and periodically while it stays the same), for
+example `[1:40] compiling and warming up the model ...`. The stages are: waiting
+for a compute node; loading the model weights; compiling and warming up the model;
+starting the API server; finishing start-up. Loading a coding model typically
+takes several minutes after the node is assigned. While the stage is `waiting for
+a compute node`, the cluster is busy and no node has been assigned yet; the
+session holds nothing during that wait.
 
 **Check.** In a second terminal **on the login node**:
 
@@ -277,21 +385,21 @@ cluster is busy.
 ai-session status
 ```
 
-`STARTING` means the model is loading: wait. If the session does not appear at
-all yet, it is still waiting for free GPUs: the wait is unbounded, but it costs
-nothing — the billing floor is computed from the time the GPUs are actually
-held, so SU accrue only once the session starts (see
-[Billing and Service Units](billing.md)). For more detail, follow the launch log
-under your state directory (`run/start.log`).
+`STARTING` with the current stage means it is still loading: wait for `READY`.
+`FAILED` gives the reason and the server log path. For more detail, follow the
+launch log under your state directory (`run/start.log`).
 
-**Fix.** Wait, or cancel with `Ctrl-C` followed by `ai-session stop` and try
-again later. If the load is slow but progressing and 900 seconds will not
-suffice, restart with a longer `READY_TIMEOUT`, for example
+**Fix.** Wait. If the model server stops while loading, start-up now ends at once
+with the log path rather than waiting out the timeout; see the log, and the
+symptom sections above. The start command gives up after `READY_TIMEOUT` seconds
+(900 for a coding session; chosen per model for browser chat). If the load is
+slow but progressing and will not finish in time, cancel with `Ctrl-C`, run
+`ai-session stop`, and restart with a longer timeout, for example
 `READY_TIMEOUT=1800 ai-session code`.
 
 ## Getting help
 
 For anything not covered here, use the support channels listed on the
 [front page](index.md). When reporting a problem, include the session id shown
-by `ai-session status` (or on the receipt printed at stop). For a billing
-question, also include the receipt path printed by `ai-session receipt`.
+by `ai-session status` (or the job id on the receipt printed at stop). For a
+usage question, also include the receipt path printed by `ai-session receipt`.
