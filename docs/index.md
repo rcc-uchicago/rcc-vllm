@@ -1,12 +1,11 @@
 # AI Sessions on RCC
 
 ai-session is a local large-language-model service on the University of Chicago Research
-Computing Cluster (RCC). Instead of sending data to a commercial provider,
-faculty and students run open LLM models on the GPUs the university already has.
+Computing Cluster (RCC). Instead of sending data to a commercial provider faculty and students run open LLM models on the GPUs the university already has.
 Compared with a cloud AI service: your prompts, code, and data never leave the
-university's systems, which matters for unpublished results; usage is reported
+university's systems; usage is reported
 to you as the tokens each session consumes; and the served models are open-weights
-checkpoints, so the exact model behind a result can be named and served again. 
+checkpoints, so the exact model behind a result can be named and served again (for provenance and publishing your research online). 
 You start a session, which serves a model on cluster GPUs, which is reached via ssh-tunnel. For chatting with the LLM you have two ways:
 browser chat with Open WebUI ([Getting Started](getting-started.md)) or command-line/in-editor coding tools ([Coding Sessions](coding/overview.md)).
 
